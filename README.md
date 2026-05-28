@@ -1,11 +1,11 @@
 # Ultrabridge Ledger Processor
 
-Turns handwritten daily planner pages from [Tools for Boox](https://github.com/mjhfunctionalashtanga/toolsboox-android) into structured digital data: OCR'd schedule entries, task lists with checkbox detection, freeform notes, and real tasks in your CalDAV task manager (Apple Reminders, tasks.org, Thunderbird, etc.).
+An add-on for [Ultrabridge](https://github.com/jdkruzr/ultrabridge) that turns handwritten daily planner pages from [Tools for Boox](https://github.com/mjhfunctionalashtanga/toolsboox-android) into structured digital data: OCR'd schedule entries, task lists with checkbox detection, freeform notes, and real tasks in your CalDAV task manager (Apple Reminders, tasks.org, Thunderbird, etc.).
 
 ## How it works
 
 ```
-Boox tablet (stylus) 
+Boox tablet (stylus)
   → Tools for Boox app syncs day JSON to Ultrabridge via WebDAV
     → This processor renders strokes onto the template grid as a PNG
       → Claude Sonnet OCRs the full page (schedule + tasks + notes)
@@ -19,38 +19,41 @@ Boox tablet (stylus)
 - **Tasks**: checkbox state + transcribed text → real CalDAV VTODOs
 - **Notes**: freeform handwriting transcribed to text
 - **Due dates**: write "due 6/15" or "due Jan 1 2027" in a task and it parses into a real due date
-- **Descriptions**: each task links back to its source with an Open URL
+- **Descriptions**: each task includes the source planner date
 
 ## Requirements
 
-- [Ultrabridge](https://ultrabridge.dev) instance with CalDAV enabled
-- [Tools for Boox](https://github.com/mjhfunctionalashtanga/toolsboox-android) app with WebCal Backup enabled
+- [Ultrabridge](https://github.com/jdkruzr/ultrabridge) instance with CalDAV enabled
+- [Tools for Boox](https://github.com/mjhfunctionalashtanga/toolsboox-android) app with WebCal Backup enabled (fork of [Tools for Boox](https://github.com/AugustMJK/toolsboox-android) by Gabor Auth, GPLv3)
 - Python 3.10+
-- Anthropic API key (for Claude Sonnet OCR)
+- [Anthropic API key](https://console.anthropic.com/) (for Claude Sonnet OCR)
 
 ## Install
 
 ```bash
 # On your Ultrabridge server
-mkdir -p /opt/ultrabridge-ledger
+git clone https://github.com/mjhfunctionalashtanga/ultrabridge-ledger.git /opt/ultrabridge-ledger
 cd /opt/ultrabridge-ledger
-
-# Copy the files
-cp process-ledger.py .
-cp .env.example .env
 
 # Create a venv and install deps
 python3 -m venv venv
 venv/bin/pip install requests Pillow anthropic
 
-# Edit .env with your settings
-nano .env
+# Configure
+cp .env.example .env
+nano .env  # fill in your settings
 
 # Test
 venv/bin/python3 process-ledger.py
 
 # Set up cron (every 15 minutes)
 (crontab -l 2>/dev/null; echo '*/15 * * * * cd /opt/ultrabridge-ledger && venv/bin/python3 process-ledger.py >> /var/log/ledger-processor.log 2>&1') | crontab -
+```
+
+Or use the deploy script from your local machine:
+
+```bash
+bash deploy.sh user@your-ultrabridge-server
 ```
 
 ## Configuration (.env)
@@ -74,13 +77,13 @@ UB_TASKS_PASS=your-password
 TASK_CREATE_LOOKBACK_DAYS=7
 
 # Optional: forward OCR'd data to a webhook (leave blank to skip)
-LEDGER_MJH_URL=
-LEDGER_MJH_SECRET=
+LEDGER_WEBHOOK_URL=
+LEDGER_WEBHOOK_SECRET=
 ```
 
 ### Minimal setup (tasks only, no webhook)
 
-Just set `LEDGER_JSON_DIR`, `ANTHROPIC_API_KEY`, and the `UB_TASKS_*` credentials. Leave `LEDGER_MJH_URL` and `LEDGER_MJH_SECRET` blank.
+Just set `LEDGER_JSON_DIR`, `ANTHROPIC_API_KEY`, and the `UB_TASKS_*` credentials. Leave `LEDGER_WEBHOOK_URL` and `LEDGER_WEBHOOK_SECRET` blank.
 
 ## Due date parsing
 
@@ -117,10 +120,16 @@ The processor renders all stylus strokes onto a replica of the planner template 
 The grid constants match `CalendarDayPage.kt` in the app:
 - Page: 1404 x 1872px
 - Cell: 600w x 50h
-- Schedule: left column (x: 20–620)
-- Tasks: right column top, 16 rows with checkboxes (x: 670–1270)
-- Notes: right column bottom (x: 670–1270)
+- Schedule: left column (x: 20-620)
+- Tasks: right column top, 16 rows with checkboxes (x: 670-1270)
+- Notes: right column bottom (x: 670-1270)
+
+## Credits
+
+- [Ultrabridge](https://github.com/jdkruzr/ultrabridge) by jdkruzr — CalDAV/WebDAV bridge for Boox and Supernote
+- [Tools for Boox](https://github.com/AugustMJK/toolsboox-android) by Gabor Auth — the original planner app (GPLv3)
+- OCR powered by [Claude Sonnet](https://www.anthropic.com/) from Anthropic
 
 ## License
 
-MIT
+MIT — this processor is an independent add-on, not a derivative of the GPLv3 app or Ultrabridge.
