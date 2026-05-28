@@ -36,6 +36,12 @@ WEBDAV_JSON_DIR = os.environ.get(
     "LEDGER_JSON_DIR",
     "/docker/ultrabridge/ultrabridge-data/tab8/toolsboox/ToolsForBoox/json",
 )
+# Parent directory containing per-device subfolders. If set, the processor will
+# merge JSON files for the same date across all devices before OCR'ing.
+LEDGER_DATA_ROOT = os.environ.get(
+    "LEDGER_DATA_ROOT",
+    "/docker/ultrabridge/ultrabridge-data",
+)
 STATE_FILE = os.environ.get(
     "LEDGER_STATE_FILE",
     "/opt/ultrabridge-ledger/state.json",
@@ -198,6 +204,66 @@ def render_note_page(strokes, scale=1):
         color = android_color_to_rgb(stroke.get("color", -16777216))
         width = max(1, round(stroke.get("strokeWidth", 3.0) * s * 0.8))
         coords = [(p["x"] * s, p["y"] * s) for p in pts]
+        draw.line(coords, fill=color, width=width, joint="curve")
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# Doodle area on the "gratitude" note page (in canvas coordinates).
+# Strokes whose centroid lands in this box are treated as a sketch
+# and uploaded to mjh.yoga as a tagged Sketch note.
+DOODLE_BOX = (60, 1005, 1344, 1820)  # left, top, right, bottom
+
+
+def extract_doodle_strokes(gratitude_strokes):
+    """Return strokes whose centroid falls inside the gratitude page's doodle box."""
+    if not gratitude_strokes:
+        return []
+    left, top, right, bottom = DOODLE_BOX
+    out = []
+    for stroke in gratitude_strokes:
+        pts = stroke.get("strokePoints") or []
+        if not pts:
+            continue
+        avg_x = sum(p["x"] for p in pts) / len(pts)
+        avg_y = sum(p["y"] for p in pts) / len(pts)
+        if left <= avg_x <= right and top <= avg_y <= bottom:
+            out.append(stroke)
+    return out
+
+
+def render_doodle_png(strokes, scale=2):
+    """Render doodle strokes as a tightly cropped PNG. Returns bytes or None."""
+    if not strokes:
+        return None
+    all_x = []
+    all_y = []
+    for s in strokes:
+        for p in s.get("strokePoints") or []:
+            all_x.append(p["x"])
+            all_y.append(p["y"])
+    if not all_x:
+        return None
+    pad = 40
+    x_min = max(DOODLE_BOX[0], int(min(all_x) - pad))
+    y_min = max(DOODLE_BOX[1], int(min(all_y) - pad))
+    x_max = min(DOODLE_BOX[2], int(max(all_x) + pad))
+    y_max = min(DOODLE_BOX[3], int(max(all_y) + pad))
+
+    w = max(1, (x_max - x_min) * scale)
+    h = max(1, (y_max - y_min) * scale)
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    for stroke in strokes:
+        pts = stroke.get("strokePoints") or []
+        if len(pts) < 2:
+            continue
+        color = android_color_to_rgb(stroke.get("color", -16777216))
+        width = max(1, round(stroke.get("strokeWidth", 3.0) * scale * 0.8))
+        coords = [((p["x"] - x_min) * scale, (p["y"] - y_min) * scale) for p in pts]
         draw.line(coords, fill=color, width=width, joint="curve")
 
     buf = BytesIO()
@@ -463,20 +529,84 @@ def forward_to_webhook(payload):
         return False
 
 
-def process_file(filepath):
-    """Process a single day JSON file."""
-    log.info(f"Processing {filepath.name}")
+def merge_day_data(file_paths):
+    """Merge multiple device JSONs for the same date into one data dict.
 
-    with open(filepath) as f:
-        data = json.load(f)
+    Strokes are deduplicated by strokeId. Scalar metadata (year/month/day/
+    startHour/locale) is taken from any file (they're invariant per date).
+    hasLanes is OR'd across all sources.
+    """
+    merged = {}
+    all_cal_by_style = {}  # style -> {strokeId: stroke}
+    all_notes_by_page = {}  # page_key -> {strokeId: stroke}
+    all_text_elements = []  # de-dup not attempted here; we union and rely on writer behaviour
+    has_lanes = False
+    latest_updated = ""
 
+    for fp in file_paths:
+        try:
+            with open(fp) as f:
+                data = json.load(f)
+        except Exception as e:
+            log.warning(f"Could not read {fp}: {e}")
+            continue
+
+        for k in ("year", "month", "day", "startHour", "locale"):
+            if k in data and k not in merged:
+                merged[k] = data[k]
+
+        has_lanes = has_lanes or bool(data.get("hasLanes"))
+
+        for style, strokes in (data.get("calendarStrokes") or {}).items():
+            bucket = all_cal_by_style.setdefault(style, {})
+            for s in strokes or []:
+                sid = s.get("strokeId")
+                if sid:
+                    bucket[sid] = s
+
+        for page_key, strokes in (data.get("noteStrokes") or {}).items():
+            bucket = all_notes_by_page.setdefault(page_key, {})
+            for s in strokes or []:
+                sid = s.get("strokeId")
+                if sid:
+                    bucket[sid] = s
+
+        for te in data.get("textElements") or []:
+            all_text_elements.append(te)
+
+        upd = str(data.get("updated", ""))
+        if upd > latest_updated:
+            latest_updated = upd
+            # Carry through fields from the most recently updated source
+            for k in ("events", "readingProgress", "calendarValues", "created"):
+                if k in data:
+                    merged[k] = data[k]
+
+    merged["hasLanes"] = has_lanes
+    merged["calendarStrokes"] = {style: list(strokes.values()) for style, strokes in all_cal_by_style.items()}
+    merged["noteStrokes"] = {pk: list(strokes.values()) for pk, strokes in all_notes_by_page.items()}
+    merged["textElements"] = all_text_elements
+    if latest_updated:
+        merged["updated"] = latest_updated
+
+    return merged
+
+
+def process_day(merged_data, label):
+    """Process merged JSON data for a single date.
+
+    label is a string identifier used in log messages (e.g. the JSON filename).
+    """
+    log.info(f"Processing {label}")
+
+    data = merged_data
     year = data.get("year", 0)
     month = data.get("month", 0)
     day = data.get("day", 0)
     start_hour = data.get("startHour")
 
     if year < 2020 or not (1 <= month <= 12) or not (1 <= day <= 31):
-        log.warning(f"Invalid date in {filepath.name}, skipping")
+        log.warning(f"Invalid date in {label}, skipping")
         return
 
     # Flatten calendarStrokes
@@ -492,7 +622,7 @@ def process_file(filepath):
             note_strokes_by_page[page_key] = page_strokes
 
     if not all_cal and not note_strokes_by_page:
-        log.info(f"No strokes in {filepath.name}, skipping")
+        log.info(f"No strokes in {label}, skipping")
         return
 
     # Render the day page with template grid + calendar strokes only (no note pages here)
@@ -508,7 +638,7 @@ def process_file(filepath):
         text = ocr_note_page(page_png)
         if text:
             note_page_texts[page_key] = text
-            log.info(f"OCR'd note page {page_key} for {filepath.name}: {len(text)} chars")
+            log.info(f"OCR'd note page {page_key} for {label}: {len(text)} chars")
 
     # Build payload for mjh.yoga
     payload = {
@@ -520,29 +650,33 @@ def process_file(filepath):
         "noteStrokes": data.get("noteStrokes", {}),
     }
 
+    task_texts = {}
+    task_checked = {}
     if ocr:
-        # Task texts keyed by row number
-        task_texts = {}
-        task_checked = {}
         for t in ocr.get("tasks", []):
             if isinstance(t, dict) and t.get("text"):
                 task_texts[t["row"]] = t["text"]
                 task_checked[t["row"]] = t.get("checked", False)
         payload["task_texts"] = task_texts
         payload["task_checked"] = task_checked
-
-        # Schedule texts
         payload["schedule_texts"] = ocr.get("schedule", [])
-
-        # Notes text
         payload["notes_text"] = ocr.get("notes", "")
 
-    # Note pages — keyed by page number, separate from the day-page Notes section
     if note_page_texts:
         payload["note_page_texts"] = note_page_texts
 
-        # Create Ultrabridge tasks for unchecked items on recent dates
-        from datetime import date, timedelta
+    # Doodle from the gratitude page → separate Sketch note
+    gratitude_strokes = note_strokes_by_page.get("gratitude") or []
+    doodle_strokes = extract_doodle_strokes(gratitude_strokes)
+    if doodle_strokes:
+        doodle_png = render_doodle_png(doodle_strokes, scale=2)
+        if doodle_png:
+            payload["sketch_png_b64"] = base64.b64encode(doodle_png).decode()
+            log.info(f"Extracted doodle for {label}: {len(doodle_strokes)} strokes, {len(doodle_png)} bytes")
+
+    # Create Ultrabridge tasks for unchecked items on recent dates
+    if task_texts:
+        from datetime import date
         date_str = f"{year:04d}-{month:02d}-{day:02d}"
         try:
             page_date = date.fromisoformat(date_str)
@@ -551,7 +685,6 @@ def process_file(filepath):
             is_recent = False
 
         if is_recent and UB_TASKS_PASS:
-            import re
             date_label = page_date.strftime('%B %d, %Y')
             for row_num, text in task_texts.items():
                 if not task_checked.get(row_num, False) and text:
@@ -562,43 +695,92 @@ def process_file(filepath):
     forward_to_webhook(payload)
 
 
-def main():
-    json_dir = Path(WEBDAV_JSON_DIR)
-    if not json_dir.exists():
-        log.info(f"JSON dir {json_dir} does not exist yet, nothing to process")
-        return
+def find_device_day_files():
+    """Walk LEDGER_DATA_ROOT for all per-device day JSONs.
 
+    Returns a dict: { base_filename (e.g. 'day-2026-05-27-v2.json'): [Path, Path, ...] }
+
+    Falls back to scanning only WEBDAV_JSON_DIR if LEDGER_DATA_ROOT doesn't exist
+    or contains no device subfolders.
+    """
+    root = Path(LEDGER_DATA_ROOT)
+    by_date = {}
+
+    if root.exists():
+        # Walk every immediate subdir as a "device" folder
+        for device_dir in root.iterdir():
+            if not device_dir.is_dir():
+                continue
+            json_dir = device_dir / "toolsboox" / "ToolsForBoox" / "json"
+            if not json_dir.is_dir():
+                continue
+            for f in list(json_dir.glob("day-*-v2.json")) + list(json_dir.glob("day-*.json")):
+                by_date.setdefault(f.name, []).append(f)
+
+    if not by_date:
+        # Fall back to single-dir scan
+        single = Path(WEBDAV_JSON_DIR)
+        if single.exists():
+            for f in list(single.glob("day-*-v2.json")) + list(single.glob("day-*.json")):
+                by_date.setdefault(f.name, []).append(f)
+
+    # If both v1 and v2 exist for the same date, prefer v2
+    deduped = {}
+    bases_seen = set()
+    # First pass: v2 files
+    for name, paths in by_date.items():
+        if name.endswith("-v2.json"):
+            base = name[:-8]  # strip "-v2.json"
+            deduped[name] = paths
+            bases_seen.add(base)
+    # Second pass: v1 files only if no v2 equivalent
+    for name, paths in by_date.items():
+        if not name.endswith("-v2.json"):
+            base = name[:-5]  # strip ".json"
+            if base not in bases_seen:
+                deduped[name] = paths
+
+    return deduped
+
+
+def main():
     state = load_state()
     processed = state.get("processed", {})
     changed = False
 
-    day_files = sorted(json_dir.glob("day-*-v2.json")) + sorted(json_dir.glob("day-*.json"))
-    seen_bases = set()
-    unique_files = []
-    for f in day_files:
-        base = f.name.replace("-v2.json", ".json")
-        if base not in seen_bases:
-            seen_bases.add(base)
-            unique_files.append(f)
+    by_date = find_device_day_files()
+    if not by_date:
+        log.info("No day JSON files found in LEDGER_DATA_ROOT or WEBDAV_JSON_DIR")
+        return
 
-    for filepath in unique_files:
-        fhash = file_hash(filepath)
-        if processed.get(filepath.name) == fhash:
+    for name in sorted(by_date.keys()):
+        paths = by_date[name]
+        # Sort for stable hash even if iteration order changes
+        paths = sorted(paths, key=lambda p: str(p))
+        # Hash the merged content so cross-device updates trigger reprocessing
+        merged = merge_day_data(paths)
+        merged_bytes = json.dumps(merged, sort_keys=True, default=str).encode()
+        merged_hash = hashlib.sha256(merged_bytes).hexdigest()
+
+        if processed.get(name) == merged_hash:
             continue
 
         try:
-            process_file(filepath)
-            processed[filepath.name] = fhash
+            sources_label = name if len(paths) == 1 else f"{name} ({len(paths)} devices)"
+            process_day(merged, sources_label)
+            processed[name] = merged_hash
             changed = True
         except Exception as e:
-            log.error(f"Error processing {filepath.name}: {e}")
+            log.error(f"Error processing {name}: {e}")
 
     if changed:
         state["processed"] = processed
         state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         save_state(state)
 
-    log.info(f"Done. {len(unique_files)} files found, {sum(1 for f in unique_files if processed.get(f.name) == file_hash(f))} up to date.")
+    total = len(by_date)
+    up_to_date = sum(1 for name in by_date if processed.get(name))
+    log.info(f"Done. {total} dates found, {up_to_date} up to date.")
 
 
 if __name__ == "__main__":
@@ -610,6 +792,7 @@ if __name__ == "__main__":
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
         WEBDAV_JSON_DIR = os.environ.get("LEDGER_JSON_DIR", WEBDAV_JSON_DIR)
+        LEDGER_DATA_ROOT = os.environ.get("LEDGER_DATA_ROOT", LEDGER_DATA_ROOT)
         STATE_FILE = os.environ.get("LEDGER_STATE_FILE", STATE_FILE)
         WEBHOOK_URL = os.environ.get("LEDGER_WEBHOOK_URL", WEBHOOK_URL)
         WEBHOOK_SECRET = os.environ.get("LEDGER_WEBHOOK_SECRET", WEBHOOK_SECRET)
