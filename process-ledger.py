@@ -592,6 +592,11 @@ def merge_day_data(file_paths):
     return merged
 
 
+def task_key(date_str, row, title):
+    """Stable identifier for an Ultrabridge task creation."""
+    return f"{date_str}|{row}|{(title or '').strip().lower()}"
+
+
 def process_day(merged_data, label):
     """Process merged JSON data for a single date.
 
@@ -685,12 +690,25 @@ def process_day(merged_data, label):
             is_recent = False
 
         if is_recent and UB_TASKS_PASS:
+            # Persist which tasks we've already pushed so the same (date, row, title)
+            # never gets sent twice — multi-device merges and stroke edits to the
+            # same date used to recreate every task on every reprocess.
+            state = load_state()
+            sent = set(state.get("tasks_sent", []))
+            new_keys = []
             date_label = page_date.strftime('%B %d, %Y')
             for row_num, text in task_texts.items():
                 if not task_checked.get(row_num, False) and text:
                     task_title, task_due = parse_due_date(text, date_str)
+                    key = task_key(date_str, row_num, task_title)
+                    if key in sent:
+                        continue
                     desc = f"From Boox planner {date_label}"
                     create_ultrabridge_task(task_title, task_due, desc)
+                    new_keys.append(key)
+            if new_keys:
+                state["tasks_sent"] = sorted(sent | set(new_keys))
+                save_state(state)
 
     forward_to_webhook(payload)
 
