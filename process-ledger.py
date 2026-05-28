@@ -179,6 +179,81 @@ def render_full_page(cal_strokes, note_strokes, start_hour, scale=1):
     return buf.getvalue()
 
 
+def render_note_page(strokes, scale=1):
+    """Render a single note page's strokes onto a blank lined background as PNG."""
+    img_w, img_h = PAGE_W * scale, PAGE_H * scale
+    img = Image.new("RGB", (img_w, img_h), (255, 255, 253))
+    draw = ImageDraw.Draw(img)
+    s = scale
+
+    # Light horizontal rules every 50px for OCR context
+    rule_grey = (220, 220, 215)
+    for y in range(int(TO * s), img_h, int(CEH * s)):
+        draw.line([(LO * s, y), ((LO + 2 * CEW + 50) * s, y)], fill=rule_grey, width=1)
+
+    for stroke in strokes:
+        pts = stroke.get("strokePoints", [])
+        if len(pts) < 2:
+            continue
+        color = android_color_to_rgb(stroke.get("color", -16777216))
+        width = max(1, round(stroke.get("strokeWidth", 3.0) * s * 0.8))
+        coords = [(p["x"] * s, p["y"] * s) for p in pts]
+        draw.line(coords, fill=color, width=width, joint="curve")
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def ocr_note_page(png_data):
+    """Send a single note page to Sonnet for freeform OCR."""
+    if not ANTHROPIC_API_KEY:
+        log.warning("No ANTHROPIC_API_KEY set, skipping note-page OCR")
+        return None
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    except ImportError:
+        log.warning("anthropic package not installed, skipping note-page OCR")
+        return None
+
+    prompt = (
+        "This is a scanned handwritten note page from a planner journal. "
+        "Transcribe ALL handwritten text exactly as written, preserving line breaks "
+        "between distinct thoughts and paragraphs.\n\n"
+        "Rules:\n"
+        "- Return ONLY the transcribed text, no commentary, no formatting markers\n"
+        "- Use blank lines between paragraphs\n"
+        "- If text is illegible, write [illegible] inline — do not guess\n"
+        "- If the page is entirely blank, return an empty string"
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64.b64encode(png_data).decode(),
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        log.error(f"Note page OCR failed: {e}")
+        return None
+
+
 def ocr_full_page(png_data, start_hour):
     """Send the full rendered page to Sonnet for complete OCR."""
     if not ANTHROPIC_API_KEY:
@@ -410,21 +485,30 @@ def process_file(filepath):
         if isinstance(style_strokes, list):
             all_cal.extend(style_strokes)
 
-    # Flatten noteStrokes
-    all_notes = []
-    for page_strokes in (data.get("noteStrokes") or {}).values():
-        if isinstance(page_strokes, list):
-            all_notes.extend(page_strokes)
+    # Keep note pages separate, keyed by page number string
+    note_strokes_by_page = {}
+    for page_key, page_strokes in (data.get("noteStrokes") or {}).items():
+        if isinstance(page_strokes, list) and page_strokes:
+            note_strokes_by_page[page_key] = page_strokes
 
-    if not all_cal and not all_notes:
+    if not all_cal and not note_strokes_by_page:
         log.info(f"No strokes in {filepath.name}, skipping")
         return
 
-    # Render full page with template grid + all strokes
-    png = render_full_page(all_cal, all_notes, start_hour, scale=2)
+    # Render the day page with template grid + calendar strokes only (no note pages here)
+    png = render_full_page(all_cal, [], start_hour, scale=2)
 
-    # OCR the full page
+    # OCR the day page
     ocr = ocr_full_page(png, start_hour)
+
+    # OCR each note page separately
+    note_page_texts = {}
+    for page_key in sorted(note_strokes_by_page.keys(), key=lambda k: int(k) if k.isdigit() else 999):
+        page_png = render_note_page(note_strokes_by_page[page_key], scale=2)
+        text = ocr_note_page(page_png)
+        if text:
+            note_page_texts[page_key] = text
+            log.info(f"OCR'd note page {page_key} for {filepath.name}: {len(text)} chars")
 
     # Build payload for mjh.yoga
     payload = {
@@ -452,6 +536,10 @@ def process_file(filepath):
 
         # Notes text
         payload["notes_text"] = ocr.get("notes", "")
+
+    # Note pages — keyed by page number, separate from the day-page Notes section
+    if note_page_texts:
+        payload["note_page_texts"] = note_page_texts
 
         # Create Ultrabridge tasks for unchecked items on recent dates
         from datetime import date, timedelta
