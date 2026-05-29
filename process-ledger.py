@@ -594,7 +594,7 @@ def merge_day_data(file_paths):
 
 def task_key(date_str, row, title):
     """Stable identifier for an Ultrabridge task creation."""
-    return f"{date_str}|{row}|{(title or '').strip().lower()}"
+    return f"{date_str}|{(title or '').strip().lower()}"
 
 
 def process_day(merged_data, label):
@@ -792,6 +792,11 @@ def main():
             log.error(f"Error processing {name}: {e}")
 
     if changed:
+        # process_day() persists tasks_sent during the loop; reload so the
+        # end-of-run save below does not clobber it (was the dupe-tasks bug).
+        latest = load_state()
+        if "tasks_sent" in latest:
+            state["tasks_sent"] = latest["tasks_sent"]
         state["processed"] = processed
         state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         save_state(state)
@@ -819,5 +824,15 @@ if __name__ == "__main__":
         UB_TASKS_USER = os.environ.get("UB_TASKS_USER", UB_TASKS_USER)
         UB_TASKS_PASS = os.environ.get("UB_TASKS_PASS", UB_TASKS_PASS)
         TASK_CREATE_LOOKBACK_DAYS = int(os.environ.get("TASK_CREATE_LOOKBACK_DAYS", str(TASK_CREATE_LOOKBACK_DAYS)))
+
+    # Single-instance guard: stop a manual run and the 15-min cron (or two
+    # crons) from running concurrently and double-creating tasks.
+    import fcntl, sys
+    _lock_fh = open("/tmp/ledger-processor.lock", "w")
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info("Another process-ledger.py run is in progress; exiting.")
+        sys.exit(0)
 
     main()
