@@ -654,6 +654,8 @@ def process_day(merged_data, label):
         "calendarStrokes": data.get("calendarStrokes", {}),
         "noteStrokes": data.get("noteStrokes", {}),
     }
+    # Full-page handwriting render -> featured image on the ledger note
+    payload["page_png_b64"] = base64.b64encode(png).decode()
 
     task_texts = {}
     task_checked = {}
