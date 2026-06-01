@@ -396,6 +396,8 @@ def parse_due_date(text, fallback_date):
     Matches patterns like:
       due 1/1/2027, due: 01/01/2027, due 2027-01-01,
       due jan 1, due january 1 2027, due 1/1
+    An optional connector word is accepted after "due", so the natural
+    phrasings "due by 6/8/2026" and "due on Jan 15" also parse.
     Strips the matched portion from the title.
     Falls back to the planner page date if no due date found.
     """
@@ -403,7 +405,7 @@ def parse_due_date(text, fallback_date):
     from datetime import date
 
     # due MM/DD/YYYY or M/D/YYYY or MM/DD/YY
-    m = re.search(r'\bdue[:\s]+(\d{1,2})/(\d{1,2})/(\d{2,4})\b', text, re.IGNORECASE)
+    m = re.search(r'\bdue(?:\s+(?:by|on))?[:\s]+(\d{1,2})/(\d{1,2})/(\d{2,4})\b', text, re.IGNORECASE)
     if m:
         month, day, yr = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if yr < 100:
@@ -412,13 +414,13 @@ def parse_due_date(text, fallback_date):
         return title, f"{yr:04d}-{month:02d}-{day:02d}"
 
     # due YYYY-MM-DD
-    m = re.search(r'\bdue[:\s]+(\d{4})-(\d{1,2})-(\d{1,2})\b', text, re.IGNORECASE)
+    m = re.search(r'\bdue(?:\s+(?:by|on))?[:\s]+(\d{4})-(\d{1,2})-(\d{1,2})\b', text, re.IGNORECASE)
     if m:
         title = (text[:m.start()] + text[m.end():]).strip(' ,;-')
         return title, f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
 
     # due MM/DD (no year — assume current year or next year if date has passed)
-    m = re.search(r'\bdue[:\s]+(\d{1,2})/(\d{1,2})\b', text, re.IGNORECASE)
+    m = re.search(r'\bdue(?:\s+(?:by|on))?[:\s]+(\d{1,2})/(\d{1,2})\b', text, re.IGNORECASE)
     if m:
         month, day = int(m.group(1)), int(m.group(2))
         today = date.today()
@@ -440,7 +442,7 @@ def parse_due_date(text, fallback_date):
         'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12,
     }
     m = re.search(
-        r'\bdue[:\s]+(' + '|'.join(months.keys()) + r')\s+(\d{1,2})(?:\s+(\d{4}))?\b',
+        r'\bdue(?:\s+(?:by|on))?[:\s]+(' + '|'.join(months.keys()) + r')\s+(\d{1,2})(?:\s+(\d{4}))?\b',
         text, re.IGNORECASE,
     )
     if m:
