@@ -547,7 +547,8 @@ def merge_day_data(file_paths):
     merged = {}
     all_cal_by_style = {}  # style -> {strokeId: stroke}
     all_notes_by_page = {}  # page_key -> {strokeId: stroke}
-    all_text_elements = []  # de-dup not attempted here; we union and rely on writer behaviour
+    all_text_by_id = {}  # elementId -> textElement (deduped across device merges)
+    all_text_noid = []   # text boxes with no elementId (legacy) — kept as-is
     all_images_by_id = {}  # elementId -> imageElement (deduped across device merges)
     has_lanes = False
     latest_updated = ""
@@ -581,7 +582,11 @@ def merge_day_data(file_paths):
                     bucket[sid] = s
 
         for te in data.get("textElements") or []:
-            all_text_elements.append(te)
+            tid = te.get("elementId")
+            if tid:
+                all_text_by_id[tid] = te
+            else:
+                all_text_noid.append(te)
 
         for ie in data.get("imageElements") or []:
             iid = ie.get("elementId")
@@ -599,7 +604,7 @@ def merge_day_data(file_paths):
     merged["hasLanes"] = has_lanes
     merged["calendarStrokes"] = {style: list(strokes.values()) for style, strokes in all_cal_by_style.items()}
     merged["noteStrokes"] = {pk: list(strokes.values()) for pk, strokes in all_notes_by_page.items()}
-    merged["textElements"] = all_text_elements
+    merged["textElements"] = list(all_text_by_id.values()) + all_text_noid
     merged["imageElements"] = list(all_images_by_id.values())
     if latest_updated:
         merged["updated"] = latest_updated
@@ -901,7 +906,10 @@ def process_day(merged_data, label):
     # Forward typed/pasted text boxes BEFORE the stroke checks below — a page can carry
     # pasted text with no handwriting at all, and the "No strokes, skipping" guard would
     # otherwise drop it. Text is already digital, so no rendering/OCR is needed.
-    text_elements = data.get("textElements") or []
+    # Skip intake-page text boxes — those are share-to-Ledger URLs the device already
+    # delivered to the intake pipeline; forwarding them here would duplicate raw links
+    # into the field ledger. Everything else (pickings, day, etc.) is genuine pasted text.
+    text_elements = [te for te in (data.get("textElements") or []) if te.get("pageKey") != "intake"]
     if text_elements:
         from datetime import datetime as _dt, timezone as _tz
         t_date = f"{year:04d}-{month:02d}-{day:02d}"
