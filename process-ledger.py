@@ -579,14 +579,29 @@ def merge_day_data(file_paths):
     has_lanes = False
     latest_updated = ""
 
+    # Read everything first so the merge can (a) honour erase tombstones from EVERY
+    # device — ignoring deletedStrokeIds meant erased ink resurrected in the OCR and
+    # re-created CalDAV tasks — and (b) apply files oldest→newest so the NEWEST
+    # device's copy of a shared id wins (path sort order used to pick the winner,
+    # so a stale mirror could revert edits). Tombstone ids compare lowercased:
+    # Android writes lowercase UUIDs, iOS uppercase. The tombstone arrays are NOT
+    # added to `merged` — a new key would change every day's content hash and
+    # re-OCR all history (the imageElements lesson).
+    loaded = []
     for fp in file_paths:
         try:
             with open(fp) as f:
-                data = json.load(f)
+                loaded.append(json.load(f))
         except Exception as e:
             log.warning(f"Could not read {fp}: {e}")
-            continue
+    loaded.sort(key=lambda d: str(d.get("updated", "")))
+    deleted_ids = set()
+    for data in loaded:
+        for key in ("deletedStrokeIds", "deletedElementIds"):
+            for t in data.get(key) or []:
+                deleted_ids.add(str(t).lower())
 
+    for data in loaded:
         for k in ("year", "month", "day", "startHour", "locale"):
             if k in data and k not in merged:
                 merged[k] = data[k]
@@ -597,26 +612,27 @@ def merge_day_data(file_paths):
             bucket = all_cal_by_style.setdefault(style, {})
             for s in strokes or []:
                 sid = s.get("strokeId")
-                if sid:
+                if sid and str(sid).lower() not in deleted_ids:
                     bucket[sid] = s
 
         for page_key, strokes in (data.get("noteStrokes") or {}).items():
             bucket = all_notes_by_page.setdefault(page_key, {})
             for s in strokes or []:
                 sid = s.get("strokeId")
-                if sid:
+                if sid and str(sid).lower() not in deleted_ids:
                     bucket[sid] = s
 
         for te in data.get("textElements") or []:
             tid = te.get("elementId")
             if tid:
-                all_text_by_id[tid] = te
+                if str(tid).lower() not in deleted_ids:
+                    all_text_by_id[tid] = te
             else:
                 all_text_noid.append(te)
 
         for ie in data.get("imageElements") or []:
             iid = ie.get("elementId")
-            if iid:
+            if iid and str(iid).lower() not in deleted_ids:
                 all_images_by_id[iid] = ie
 
         upd = str(data.get("updated", ""))
@@ -1139,14 +1155,20 @@ def find_device_day_files():
             for json_dir in device_dir.glob("*/ToolsForBoox/json"):
                 if not json_dir.is_dir():
                     continue
-                for f in list(json_dir.glob("day-*-v2.json")) + list(json_dir.glob("day-*.json")):
+                # day-*.json also matches -v2 files — exclude them or every v2 day is
+                # listed (and read/merged/hashed) twice per pass.
+                for f in list(json_dir.glob("day-*-v2.json")) + [
+                    p for p in json_dir.glob("day-*.json") if not p.name.endswith("-v2.json")
+                ]:
                     by_date.setdefault(f.name, []).append(f)
 
     if not by_date:
         # Fall back to single-dir scan
         single = Path(WEBDAV_JSON_DIR)
         if single.exists():
-            for f in list(single.glob("day-*-v2.json")) + list(single.glob("day-*.json")):
+            for f in list(single.glob("day-*-v2.json")) + [
+                p for p in single.glob("day-*.json") if not p.name.endswith("-v2.json")
+            ]:
                 by_date.setdefault(f.name, []).append(f)
 
     # If both v1 and v2 exist for the same date, prefer v2
