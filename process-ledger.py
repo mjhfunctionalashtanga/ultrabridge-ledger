@@ -83,16 +83,31 @@ NOTES_Y1 = TO + 19 * CEH  # 1011
 
 
 def load_state():
+    # A corrupt/truncated state file (the disk-full incident) must not kill the cron:
+    # sideline it and start clean — the content hashes rebuild on the next pass.
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            quarantine = f"{STATE_FILE}.corrupt-{int(time.time())}"
+            log.error(f"state file unreadable ({e}); sidelining to {quarantine}")
+            try:
+                os.replace(STATE_FILE, quarantine)
+            except OSError:
+                pass
     return {}
 
 
 def save_state(state):
+    # Atomic: a crash or full disk mid-write must never truncate the live state file.
     Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
+    tmp = f"{STATE_FILE}.tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
 
 
 def file_hash(path):
@@ -277,6 +292,15 @@ def render_doodle_png(strokes, scale=2):
     return buf.getvalue()
 
 
+class TransientOcrError(Exception):
+    """OCR failed for a reason that should retry next pass (API outage, rate limit).
+
+    Distinct from the deliberate config skips (no API key / no package), which still
+    return None: a transient failure must NOT let the day be marked processed, or a
+    blip in the API becomes a permanent gap in the corpus.
+    """
+
+
 def ocr_note_page(png_data):
     """Send a single note page to Sonnet for freeform OCR."""
     if not ANTHROPIC_API_KEY:
@@ -323,7 +347,7 @@ def ocr_note_page(png_data):
         return response.content[0].text.strip()
     except Exception as e:
         log.error(f"Note page OCR failed: {e}")
-        return None
+        raise TransientOcrError(str(e))
 
 
 def ocr_full_page(png_data, start_hour):
@@ -388,12 +412,14 @@ def ocr_full_page(png_data, start_hour):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         return json.loads(text)
     except json.JSONDecodeError as e:
+        # Bad JSON from the model is NOT transient — retrying re-bills the same page
+        # every pass. Skip it like before; a stroke edit will re-hash and retry it.
         log.error(f"OCR returned invalid JSON: {e}")
         log.error(f"Raw response: {text[:500]}")
         return None
     except Exception as e:
         log.error(f"OCR API call failed: {e}")
-        return None
+        raise TransientOcrError(str(e))
 
 
 def parse_due_date(text, fallback_date):
@@ -1085,7 +1111,10 @@ def process_day(merged_data, label):
                 state["tasks_sent"] = sorted(sent | set(new_keys))
                 save_state(state)
 
-    forward_to_webhook(payload)
+    # A failed forward must leave the day unprocessed so the next pass retries —
+    # otherwise a webhook outage becomes a permanent gap on mjh.yoga.
+    if WEBHOOK_URL and not forward_to_webhook(payload):
+        raise RuntimeError(f"webhook forward failed for {label}")
 
 
 def find_device_day_files():
@@ -1212,14 +1241,13 @@ def main():
             log.error(f"Error processing {name}: {e}")
 
     if changed:
-        # process_day() persists tasks_sent during the loop; reload so the
-        # end-of-run save below does not clobber it (was the dupe-tasks bug).
+        # process_day() persists tasks_sent AND intake_sent during the loop; rebase on
+        # a fresh load so the end-of-run save clobbers NO mid-run key (the dupe-tasks
+        # bug, later repeated by intake_sent).
         latest = load_state()
-        if "tasks_sent" in latest:
-            state["tasks_sent"] = latest["tasks_sent"]
-        state["processed"] = processed
-        state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        save_state(state)
+        latest["processed"] = processed
+        latest["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        save_state(latest)
 
     total = len(by_date)
     up_to_date = sum(1 for name in by_date if processed.get(name))
