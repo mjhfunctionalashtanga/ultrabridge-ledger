@@ -55,6 +55,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 UB_TASKS_URL = os.environ.get("UB_TASKS_URL", "https://ultrabridge.mjh.yoga/tasks")
 UB_TASKS_USER = os.environ.get("UB_TASKS_USER", "admin")
 UB_TASKS_PASS = os.environ.get("UB_TASKS_PASS", "")
+SERVER_TASKS_ENABLED = os.environ.get("LEDGER_SERVER_TASKS", "0") == "1"  # demoted: device pushes VTODOs now
 TASK_CREATE_LOOKBACK_DAYS = int(os.environ.get("TASK_CREATE_LOOKBACK_DAYS", "7"))
 
 # Pickings → journal (michaeljoelhall.com social_archive) + mjh.yoga /notes/ mirror.
@@ -83,26 +84,42 @@ NOTES_Y1 = TO + 19 * CEH  # 1011
 
 
 def load_state():
-    # A corrupt/truncated state file (the disk-full incident) must not kill the cron:
-    # sideline it and start clean — the content hashes rebuild on the next pass.
-    if os.path.exists(STATE_FILE):
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE) as f:
+            data = f.read()
+        if not data.strip():
+            raise ValueError("empty state file")
+        return json.loads(data)
+    except Exception as e:
+        # Corrupt/empty (e.g. disk-full truncation). Sideline the bad file so the
+        # next run doesn't trip on it again, then recover from the newest backup
+        # rather than {} — a blank state re-sends every task (dupes).
         try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, ValueError, OSError) as e:
-            quarantine = f"{STATE_FILE}.corrupt-{int(time.time())}"
-            log.error(f"state file unreadable ({e}); sidelining to {quarantine}")
+            os.replace(STATE_FILE, f"{STATE_FILE}.corrupt-{int(time.time())}")
+        except OSError:
+            pass
+        import glob
+        baks = sorted(glob.glob(STATE_FILE + ".bak-*") + glob.glob(STATE_FILE + ".corrupt-*"),
+                      key=lambda p: os.path.getmtime(p))
+        for b in reversed(baks):
             try:
-                os.replace(STATE_FILE, quarantine)
-            except OSError:
-                pass
-    return {}
+                with open(b) as f:
+                    d = json.load(f)
+                log.error(f"state.json unreadable ({e}); recovered from {b}")
+                return d
+            except Exception:
+                continue
+        log.error(f"state.json unreadable ({e}) and no valid backup; starting empty")
+        return {}
 
 
 def save_state(state):
-    # Atomic: a crash or full disk mid-write must never truncate the live state file.
     Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
-    tmp = f"{STATE_FILE}.tmp"
+    # Atomic write: a crash/disk-full mid-write must not truncate state.json to
+    # 0 bytes (that silently killed the cron for ~a day on 2026-07-14).
+    tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
         f.flush()
@@ -576,6 +593,7 @@ def merge_day_data(file_paths):
     all_text_by_id = {}  # elementId -> textElement (deduped across device merges)
     all_text_noid = []   # text boxes with no elementId (legacy) — kept as-is
     all_images_by_id = {}  # elementId -> imageElement (deduped across device merges)
+    all_ledger_by_id = {}  # ledgerItem id -> item (deduped across device merges)
     has_lanes = False
     latest_updated = ""
 
@@ -635,6 +653,11 @@ def merge_day_data(file_paths):
             if iid and str(iid).lower() not in deleted_ids:
                 all_images_by_id[iid] = ie
 
+        for li in data.get("ledgerItems") or []:
+            lid = li.get("id")
+            if lid and str(lid).lower() not in deleted_ids:
+                all_ledger_by_id[lid] = li
+
         upd = str(data.get("updated", ""))
         if upd > latest_updated:
             latest_updated = upd
@@ -648,6 +671,8 @@ def merge_day_data(file_paths):
     merged["noteStrokes"] = {pk: list(strokes.values()) for pk, strokes in all_notes_by_page.items()}
     merged["textElements"] = list(all_text_by_id.values()) + all_text_noid
     merged["imageElements"] = list(all_images_by_id.values())
+    if all_ledger_by_id:
+        merged["ledgerItems"] = list(all_ledger_by_id.values())
     if latest_updated:
         merged["updated"] = latest_updated
 
@@ -677,6 +702,24 @@ def images_in_box(images, box):
         if left <= cx <= right and top <= cy <= bottom:
             out.append(ie)
     return out
+
+
+def texts_in_box(texts, box):
+    """Pasted TextElements whose center falls in the box, joined top-to-bottom then
+    left-to-right. Pasted text is already digital (no OCR needed) — this lets a Pickings
+    zone's typed/pasted article text be routed like its handwriting."""
+    left, top, right, bottom = box
+    picked = []
+    for te in texts or []:
+        t = (te.get("text") or "").strip()
+        if not t:
+            continue
+        cx = float(te.get("x", 0)) + float(te.get("width", 0)) / 2.0
+        cy = float(te.get("y", 0)) + float(te.get("height", 0)) / 2.0
+        if left <= cx <= right and top <= cy <= bottom:
+            picked.append((cy, cx, t))
+    picked.sort(key=lambda p: (p[0], p[1]))
+    return "\n\n".join(p[2] for p in picked)
 
 
 def render_pickings_box(box, strokes, images, scale=2):
@@ -814,15 +857,18 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
             log.error(f"Pickings {kind} post failed: {e}")
 
     # Image 1 + Image 2 -> their own entries (square composites of pasted photo + ink).
-    image_urls = []
+    # Each tile carries the pasted quote/caption text so the picture shows the words too
+    # (MJH: the pasted text should ride ON the image AND stand alone as the quote).
+    image_urls = []  # (url, caption) so the mjh.yoga mirror can show the caption under each image
     for i, ie in enumerate(image_elements, 1):
         b64 = ie.get("data")
         if not b64:
             continue
+        cap = (ie.get("caption") or "").strip()
         body = {
             "platform": "pickings", "type": "image",
             "source_id": f"pickings-{date_str}-img{i}", "timestamp": timestamp,
-            "title": f"Pickings · {date_str}", "caption": "",
+            "title": f"Pickings · {date_str}", "caption": cap,
             "media": [{"data_base64": b64, "kind": "image", "filename": f"pickings-{date_str}-{i}.png"}],
             "tags": ["pickings"],
         }
@@ -832,7 +878,7 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
             if r.ok:
                 for m in (r.json().get("media") or []):
                     if m.get("url"):
-                        image_urls.append(m["url"])
+                        image_urls.append((m["url"], cap))
         except Exception as e:
             log.error(f"Pickings image {i} post failed: {e}")
 
@@ -851,8 +897,12 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
                 html.append(f'<p><img src="{hand_urls["quotes"]}" style="max-width:100%;border-radius:4px"></p>')
             if quotes_text:
                 html.append("<blockquote>" + quotes_text.replace("\n", "<br>") + "</blockquote>")
-        for u in image_urls:
-            html.append(f'<p><img src="{u}" style="max-width:100%;border-radius:4px"></p>')
+        for u, cap in image_urls:
+            html.append(f'<figure style="margin:0 0 1em"><img src="{u}" style="max-width:100%;border-radius:4px">')
+            if cap:
+                html.append('<figcaption style="font-size:.9em;color:#555;margin-top:.3em">'
+                            + cap.replace("\n", "<br>") + "</figcaption>")
+            html.append("</figure>")
         html.append(f'<p><a href="https://michaeljoelhall.com/journal/{date_str}/">View in the journal &rarr;</a></p>')
         note_body = {
             "title": f"Pickings — {date_str}",
@@ -950,8 +1000,10 @@ def process_day(merged_data, label):
     # otherwise drop it. Text is already digital, so no rendering/OCR is needed.
     # Skip intake-page text boxes — those are share-to-Ledger URLs the device already
     # delivered to the intake pipeline; forwarding them here would duplicate raw links
-    # into the field ledger. Everything else (pickings, day, etc.) is genuine pasted text.
-    text_elements = [te for te in (data.get("textElements") or []) if te.get("pageKey") != "intake"]
+    # into the field ledger. Also skip pickings-page text — that's routed by zone in the
+    # Pickings block below (folded into the Notes/Quotes entries AND captioned onto the
+    # image tiles), so forwarding it here too would double-post it.
+    text_elements = [te for te in (data.get("textElements") or []) if te.get("pageKey") not in ("intake", "pickings")]
     if text_elements:
         from datetime import datetime as _dt, timezone as _tz
         t_date = f"{year:04d}-{month:02d}-{day:02d}"
@@ -1016,6 +1068,24 @@ def process_day(merged_data, label):
     if note_page_texts:
         payload["note_page_texts"] = note_page_texts
 
+    # On-device structured items (dual-face task/event). Forward ONLY the user-curated
+    # lasso/vision items — the ambient "auto" whole-section OCR is noisier than this
+    # script's own Claude page OCR, so it must not override the rendered task/schedule text.
+    ledger_items = [
+        {
+            "kind": li.get("kind"),
+            "text": (li.get("text") or "").strip(),
+            "done": bool(li.get("done")),
+            "time": li.get("time"),
+            "display": li.get("display"),
+            "source": li.get("source"),
+        }
+        for li in (data.get("ledgerItems") or [])
+        if str(li.get("source") or "").startswith("lasso") and (li.get("text") or "").strip()
+    ]
+    if ledger_items:
+        payload["ledger_items"] = ledger_items
+
     # Doodle from the gratitude page → separate Sketch note. Composite any pasted image(s)
     # in the doodle box PLUS the ink strokes, on the full landscape box (like the capture card).
     gratitude_strokes = note_strokes_by_page.get("gratitude") or []
@@ -1038,7 +1108,8 @@ def process_day(merged_data, label):
     # Pickings page -> journal (michaeljoelhall.com) + mjh.yoga /notes/
     pickings_strokes = note_strokes_by_page.get("pickings") or []
     pickings_images = [ie for ie in (data.get("imageElements") or []) if ie.get("page") == "pickings"]
-    if pickings_strokes or pickings_images:
+    pickings_texts = [te for te in (data.get("textElements") or []) if te.get("pageKey") == "pickings"]
+    if pickings_strokes or pickings_images or pickings_texts:
         notes_zone   = strokes_in_box(pickings_strokes, PICKINGS_NOTES_BOX)
         quotes_zone  = strokes_in_box(pickings_strokes, PICKINGS_QUOTES_BOX)
         # Images placed WITHIN the notes/quotes boxes themselves (a quote can be an image
@@ -1047,6 +1118,18 @@ def process_day(merged_data, label):
         quotes_imgs  = images_in_box(pickings_images, PICKINGS_QUOTES_BOX)
         notes_text   = ocr_note_page(render_note_page(notes_zone, scale=2)) if notes_zone else ""
         quotes_text  = ocr_note_page(render_note_page(quotes_zone, scale=2)) if quotes_zone else ""
+        # Pasted (digital) text per zone — already text, so no OCR. Fold it into each zone's
+        # transcription (pasted first, handwriting after) so the standalone Notes/Quotes
+        # journal entries carry it. The Quotes-zone pasted text is ALSO used to caption the
+        # image tiles below — MJH wants a pasted quote to ride ON the picture, not only as
+        # its own quote card.
+        notes_pasted  = texts_in_box(pickings_texts, PICKINGS_NOTES_BOX)
+        quotes_pasted = texts_in_box(pickings_texts, PICKINGS_QUOTES_BOX)
+        notes_text  = "\n\n".join(t for t in (notes_pasted, notes_text) if t)
+        quotes_text = "\n\n".join(t for t in (quotes_pasted, quotes_text) if t)
+        # The caption that rides on each image tile: prefer text pasted inside that tile,
+        # else the page's quote (pasted preferred, else the handwritten quote transcription).
+        shared_img_caption = quotes_pasted or quotes_text
         # Composite (strokes + in-box images) for each text zone.
         notes_png = (render_pickings_box(PICKINGS_NOTES_BOX, notes_zone, notes_imgs, scale=2)
                      if (notes_zone or notes_imgs) else None)
@@ -1065,8 +1148,10 @@ def process_day(merged_data, label):
             b_strokes = strokes_in_box(pickings_strokes, box)
             png = render_pickings_box(box, b_strokes, b_imgs, scale=2)
             if png:
-                box_images.append({"data": base64.b64encode(png).decode()})
-        log.info(f"Pickings for {label}: notes_zone={len(notes_zone)} quotes_zone={len(quotes_zone)} tiles={len(box_images)}")
+                b_caption = texts_in_box(pickings_texts, box) or shared_img_caption
+                box_images.append({"data": base64.b64encode(png).decode(), "caption": b_caption})
+        log.info(f"Pickings for {label}: notes_zone={len(notes_zone)} quotes_zone={len(quotes_zone)} "
+                 f"tiles={len(box_images)} pasted(notes={len(notes_pasted)},quotes={len(quotes_pasted)})")
         post_pickings(pdate, pts, box_images, notes_text or "", quotes_text or "", notes_png, quotes_png)
 
     # MichaelFilter intake page -> mjh.yoga intake endpoint (four panels: THE READ /
@@ -1106,7 +1191,7 @@ def process_day(merged_data, label):
         except ValueError:
             is_recent = False
 
-        if is_recent and UB_TASKS_PASS:
+        if is_recent and UB_TASKS_PASS and SERVER_TASKS_ENABLED:
             # Persist which tasks we've already pushed so the same (date, row, title)
             # never gets sent twice — multi-device merges and stroke edits to the
             # same date used to recreate every task on every reprocess.
