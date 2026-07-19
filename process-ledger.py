@@ -519,10 +519,13 @@ def create_ultrabridge_task(title, due_date_str=None, description=None):
     due_line = ""
     if due_date_str:
         due_line = f"DUE:{due_date_str.replace('-', '')}T235900Z\r\n"
+    def ical_escape(text):
+        return (text.replace("\\", "\\\\").replace("\n", "\\n")
+                .replace(",", "\\,").replace(";", "\\;"))
+
     desc_line = ""
     if description:
-        escaped = description.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
-        desc_line = f"DESCRIPTION:{escaped}\r\n"
+        desc_line = f"DESCRIPTION:{ical_escape(description)}\r\n"
     now = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     vcal = (
         "BEGIN:VCALENDAR\r\n"
@@ -531,7 +534,9 @@ def create_ultrabridge_task(title, due_date_str=None, description=None):
         "BEGIN:VTODO\r\n"
         f"UID:{task_uid}\r\n"
         f"DTSTAMP:{now}\r\n"
-        f"SUMMARY:{title}\r\n"
+        # SUMMARY was unescaped while DESCRIPTION was — a comma/semicolon in an
+        # OCR'd title produced a malformed/truncated VTODO.
+        f"SUMMARY:{ical_escape(title)}\r\n"
         f"{desc_line}"
         f"{due_line}"
         "STATUS:NEEDS-ACTION\r\n"

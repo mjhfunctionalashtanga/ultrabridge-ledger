@@ -71,16 +71,30 @@ for h in ics_hrefs:
 
 print(f"Deleted: {deleted}; failed: {failed}")
 
-# Clear the state's tasks_sent (so dedup starts fresh) AND
-# the processed-hash for recent dates so the processor reprocesses
-# and recreates the tasks (now deduplicated via tasks_sent).
+# Clear the state ONLY when every delete succeeded: clearing tasks_sent while some
+# tasks survived on the server would recreate them as duplicates on the next pass —
+# and a crash after deletion but before this point loses nothing now, because the
+# next run of this script simply resumes (deletes are idempotent).
+if failed:
+    sys.exit(f"{failed} deletes failed — state left untouched; fix and re-run.")
+
 state_path = Path(STATE_FILE)
 if state_path.exists():
+    import datetime
+    lookback = int(os.environ.get("TASK_CREATE_LOOKBACK_DAYS", "7"))
+    cutoff = (datetime.date.today() - datetime.timedelta(days=lookback)).isoformat()
     state = json.loads(state_path.read_text())
     state.pop("tasks_sent", None)
     processed = state.get("processed", {})
-    # Force re-process all day-* entries; safe because OCR is cached server-side
-    # only by our state hash, so clearing it just makes a fresh pass.
-    state["processed"] = {k: v for k, v in processed.items() if not k.startswith("day-")}
-    state_path.write_text(json.dumps(state, indent=2))
-    print(f"State cleared: removed tasks_sent and reset {len(processed) - len(state['processed'])} day hashes")
+    # Only reset RECENT day hashes — the processor only creates tasks for days inside
+    # the lookback window, so wiping ALL hashes just re-OCR'd (and re-billed) the
+    # whole history for nothing.
+    def keep(key):
+        m = re.match(r"day-(\d{4}-\d{2}-\d{2})", key)
+        return not m or m.group(1) < cutoff
+    state["processed"] = {k: v for k, v in processed.items() if keep(k)}
+    # Atomic (the state.json lesson).
+    tmp = state_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(state_path)
+    print(f"State cleared: removed tasks_sent and reset {len(processed) - len(state['processed'])} recent day hashes")
