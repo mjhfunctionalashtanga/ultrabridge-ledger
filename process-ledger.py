@@ -42,6 +42,15 @@ LEDGER_DATA_ROOT = os.environ.get(
     "LEDGER_DATA_ROOT",
     "/docker/ultrabridge/ultrabridge-data",
 )
+# The media store for by-reference day-JSON payloads (WIRE-MEDIA-BY-REFERENCE.md): once the
+# devices externalize, an element carries data="" plus dataRef="<sha256>.<png|jpg>" and the
+# bytes live in a media/ dir the devices sync alongside calendar/. On the dav tree that is
+# <root>/media, two levels up from the json dir (.../data/ToolsForBoox/json -> .../data/media),
+# which is why the default is derived rather than fixed. Env-overridable like the dirs above.
+LEDGER_MEDIA_DIR = os.environ.get(
+    "LEDGER_MEDIA_DIR",
+    os.path.normpath(os.path.join(WEBDAV_JSON_DIR, "..", "..", "media")),
+)
 STATE_FILE = os.environ.get(
     "LEDGER_STATE_FILE",
     "/opt/ultrabridge-ledger/state.json",
@@ -732,6 +741,31 @@ def texts_in_box(texts, box):
     return "\n\n".join(p[2] for p in picked)
 
 
+def ledger_image_b64(ie):
+    """An image element's pixels, as base64 — from either face of the two-faced wire
+    (WIRE-MEDIA-BY-REFERENCE.md, both device repos): inline in `data`, or in a media-store
+    file named by `dataRef` (<sha256-of-bytes>.<png|jpg>) once the devices externalize.
+    Inline wins when both appear. A missing or malformed ref returns None — the image is
+    skipped and logged, never fatal, so an errored blob can't fail the day (the
+    processed[name] success-path contract stays intact)."""
+    b64 = ie.get("data")
+    if b64:
+        return b64
+    ref = ie.get("dataRef") or ""
+    if not ref:
+        return None
+    stem, _, ext = ref.partition(".")
+    if len(stem) != 64 or ext not in ("png", "jpg") or any(c not in "0123456789abcdef" for c in stem):
+        log.warning(f"Malformed dataRef skipped: {ref!r}")
+        return None
+    path = Path(LEDGER_MEDIA_DIR) / ref
+    try:
+        return base64.b64encode(path.read_bytes()).decode()
+    except OSError as e:
+        log.warning(f"Media blob missing for dataRef {ref}: {e}")
+        return None
+
+
 def render_pickings_box(box, strokes, images, scale=2):
     """Flatten everything filling one Pickings image tile — any pasted image(s) PLUS the
     ink strokes drawn in or on top of them — into a single cropped PNG. Returns bytes or
@@ -743,7 +777,7 @@ def render_pickings_box(box, strokes, images, scale=2):
 
     # 1) Paste any images at their position relative to the box.
     for ie in images or []:
-        b64 = ie.get("data")
+        b64 = ledger_image_b64(ie)
         if not b64:
             continue
         try:
@@ -1185,7 +1219,7 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
     # (MJH: the pasted text should ride ON the image AND stand alone as the quote).
     image_urls = []  # (url, caption) so the mjh.yoga mirror can show the caption under each image
     for i, ie in enumerate(image_elements, 1):
-        b64 = ie.get("data")
+        b64 = ledger_image_b64(ie)
         if not b64:
             continue
         cap = (ie.get("caption") or "").strip()
@@ -1221,7 +1255,7 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
     legible = [t for t in (notes_text, quotes_text) if t and t.strip().lower() != "[illegible]"]
     page_cells = [("Notes", notes_png), ("Quotes", quotes_png)]
     for i, ie in enumerate(image_elements[:2], 1):
-        raw = ie.get("data")
+        raw = ledger_image_b64(ie)
         page_cells.append(("Image %d" % i, base64.b64decode(raw) if raw else None))
     if not (image_elements or legible):
         log.info("Pickings page %s-page: board holds no picture and nothing legible; not composing", sid)
@@ -1858,6 +1892,12 @@ if __name__ == "__main__":
                 os.environ.setdefault(k.strip(), v.strip())
         WEBDAV_JSON_DIR = os.environ.get("LEDGER_JSON_DIR", WEBDAV_JSON_DIR)
         LEDGER_DATA_ROOT = os.environ.get("LEDGER_DATA_ROOT", LEDGER_DATA_ROOT)
+        # Re-derive from the (possibly .env-overridden) json dir unless set explicitly —
+        # the crontab sets LEDGER_JSON_DIR inline, and media/ sits two levels up from it.
+        LEDGER_MEDIA_DIR = os.environ.get(
+            "LEDGER_MEDIA_DIR",
+            os.path.normpath(os.path.join(WEBDAV_JSON_DIR, "..", "..", "media")),
+        )
         STATE_FILE = os.environ.get("LEDGER_STATE_FILE", STATE_FILE)
         WEBHOOK_URL = os.environ.get("LEDGER_WEBHOOK_URL", WEBHOOK_URL)
         WEBHOOK_SECRET = os.environ.get("LEDGER_WEBHOOK_SECRET", WEBHOOK_SECRET)
