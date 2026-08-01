@@ -15,6 +15,7 @@ Dependencies: requests Pillow anthropic
 import json
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
 from io import BytesIO
@@ -1067,15 +1068,26 @@ def post_doodle(date_str, timestamp, doodle_png):
 
 
 # ---------------------------------------------------------------------------
-# Named surfaces (renamed / extra Pickings boards, named Synthesize topic pages)
+# Named surfaces (renamed / extra Pickings boards, named Synthesize topic pages,
+# named Grid / Jot documents)
 #
 # The device stores a surface's ink in the day JSON under a note-page KEY. The default
-# board keeps the legacy key ("pickings" / "synthesize"), but adding or renaming one
-# mints a fresh key — PickingsStore uses "pickings-<millis>", SynthPageStore uses
-# "synthesize-<millis>" — and records the display name in a sidecar index:
+# board keeps the legacy key ("pickings" / "synthesize" / "grid" / "sketch"), but adding
+# or renaming one mints a fresh key — PickingsStore uses "pickings-<millis>",
+# SynthPageStore "synthesize-<millis>", and LedgerDocumentStore (Grid + Jot) mints
+# "grid-<millis>" / "sketch-<millis>" — and records the display name in a sidecar index:
 #
-#   <device>/<tree>/pickings-index/<YYYY-MM-DD>.json  -> [{"key","name"}]      (per day)
-#   <device>/<tree>/synth-index/pages.json            -> [{"key","name","date"}] (global)
+#   <tree>/pickings-index/<YYYY-MM-DD>.json  -> [{"key","name"}]        (per day)
+#   <tree>/synth-index/pages.json            -> [{"key","name","date"}] (global)
+#   <tree>/grid-index/pages.json             -> [{"key","name","date"}] (global)
+#   <tree>/sketch-index/pages.json           -> [{"key","name","date"}] (global)
+#
+# grid-index / sketch-index carry LedgerDocumentStore's identity rule (its nameOf):
+# the DAILY page shares its bare key across every day, so a daily-page title applies
+# only when the entry's date matches; a minted document key is globally unique, so its
+# name applies on any day the document was written on. Jot is the surface Michael names
+# Jot but its keys have said "sketch" since before it had a name — the index dir and the
+# keys keep the old spelling on purpose (renaming them would migrate his ink).
 #
 # Matching only the legacy key meant a renamed board's content rode the day JSON under a
 # key nothing downstream recognised, and posted nowhere. Match the prefixes instead.
@@ -1091,12 +1103,67 @@ def is_synth_key(key):
     return key == "synthesize" or key.startswith("synthesize-")
 
 
+def base_page_key(key):
+    """A note-page key without its sub-page tail: 'grid#1' -> 'grid', 'grid-123#2' ->
+    'grid-123'. The name indexes are keyed by the base — a document's sub-pages share
+    its name (LedgerDocumentStore.isMine/nameOf strip the tail the same way)."""
+    return (key or "").split("#", 1)[0]
+
+
+def is_grid_key(key):
+    base = base_page_key(key)
+    return base == "grid" or base.startswith("grid-")
+
+
+def is_sketch_key(key):
+    base = base_page_key(key)
+    return base == "sketch" or base.startswith("sketch-")
+
+
+def document_idem_key(default_key, key, date_str):
+    """Idempotency key for a Grid/Jot page note. The DAILY page's keys ('grid',
+    'grid#1') are shared by every day in history, so they get date-stamped or one
+    day's note would overwrite every other day's; a minted document key
+    ('grid-<millis>', tails included) is already unique on its own and stable
+    across days, exactly like the named Synthesize keys."""
+    base, sep, tail = (key or "").partition("#")
+    if base != default_key:
+        return key
+    return "%s-%s%s%s" % (default_key, date_str, sep, tail)
+
+
 def _read_json_file(path, default):
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return default
+
+
+def sidecar_tree_roots():
+    """Every synced tree root that can hold the sidecar dirs (pickings-index/,
+    synth-index/, grid-index/, sketch-index/, text-notes/), in merge order —
+    later roots win on conflict.
+
+    Two layouts exist. The multi-device layout is LEDGER_DATA_ROOT/<device>/<tree>/.
+    The deployed single-dir layout (the crontab forces LEDGER_DATA_ROOT to a
+    nonexistent path and points LEDGER_JSON_DIR straight at the dav tree) keeps the
+    sidecars two levels above the json dir — .../data/ToolsForBoox/json -> .../data —
+    the same derivation LEDGER_MEDIA_DIR uses. Without the derived root the name
+    indexes were unreachable in deployment. A missing root is simply absent from
+    the list: no sidecars means no names, never an error.
+    """
+    roots = []
+    root = Path(LEDGER_DATA_ROOT)
+    if root.exists():
+        roots.extend(p for p in sorted(root.glob("*/*")) if p.is_dir())
+    try:
+        single = Path(WEBDAV_JSON_DIR).parent.parent
+        if single.is_dir() and all(single.resolve() != r.resolve() for r in roots):
+            roots.append(single)
+    except OSError:
+        pass
+    return roots
 
 
 def named_page_names(date_str):
@@ -1107,26 +1174,76 @@ def named_page_names(date_str):
     with no registry entry still syncs, just under its default label.
     """
     names = {}
-    root = Path(LEDGER_DATA_ROOT)
-    if not root.exists():
-        return names
-    for idx in sorted(root.glob("*/*/pickings-index/%s.json" % date_str)):
-        for entry in _read_json_file(str(idx), []) or []:
+    for tree in sidecar_tree_roots():
+        for entry in _read_json_file(str(tree / "pickings-index" / ("%s.json" % date_str)), []) or []:
             if isinstance(entry, dict) and entry.get("key"):
                 names[entry["key"]] = (entry.get("name") or "").strip()
-    for idx in sorted(root.glob("*/*/synth-index/pages.json")):
-        for entry in _read_json_file(str(idx), []) or []:
+        for entry in _read_json_file(str(tree / "synth-index" / "pages.json"), []) or []:
             if isinstance(entry, dict) and entry.get("key") and str(entry.get("date") or "") == date_str:
+                names[entry["key"]] = (entry.get("name") or "").strip()
+        # Grid + Jot follow LedgerDocumentStore.nameOf: the bare daily key is
+        # date-scoped (titling the 21st's grid must not title the 22nd's), a minted
+        # "grid-<millis>" / "sketch-<millis>" key names its document on any day.
+        for subdir, default_key in (("grid-index", "grid"), ("sketch-index", "sketch")):
+            for entry in _read_json_file(str(tree / subdir / "pages.json"), []) or []:
+                if not (isinstance(entry, dict) and entry.get("key")):
+                    continue
+                if entry["key"] == default_key and str(entry.get("date") or "") != date_str:
+                    continue
                 names[entry["key"]] = (entry.get("name") or "").strip()
     return names
 
 
-def post_named_note(date_str, key, display_name, surface, text, page_png=None):
-    """Mirror a named working surface (Synthesize topic page) to mjh.yoga /notes/.
+def day_text_notes(date_str):
+    """The day's typed Text Notes, merged across every synced tree:
+    [{"id","title","body"}], blank notes dropped, sorted by id for a stable hash.
+
+    Shape (TextNotesStore): <tree>/text-notes/notes-YYYY-MM-DD.json is a JSON array
+    of {"id","title","body"} plus a last-edit millis the two platforms spell
+    differently — Android writes "u", iOS writes "updatedAt" — so both are read.
+    Cross-tree merge is the store's own: union of ids, newest edit wins per id.
+    The edit stamp is used ONLY to pick a winner and is NOT returned, so a pure
+    timestamp touch with identical text never re-triggers a day.
+
+    Missing dirs/files mean no notes; a malformed file is logged and skipped,
+    never fatal (the processed[name] success-path contract).
+    """
+    by_id = {}
+    for tree in sidecar_tree_roots():
+        path = tree / "text-notes" / ("notes-%s.json" % date_str)
+        if not path.exists():
+            continue
+        entries = _read_json_file(str(path), None)
+        if not isinstance(entries, list):
+            log.warning("Text notes file unreadable, skipping: %s", path)
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            title = (entry.get("title") or "").strip()
+            body = (entry.get("body") or "").strip()
+            if not title and not body:
+                continue
+            updated = entry.get("u") or entry.get("updatedAt") or 0
+            try:
+                updated = int(updated)
+            except (TypeError, ValueError):
+                updated = 0
+            cur = by_id.get(entry["id"])
+            if cur is None or updated >= cur[0]:
+                by_id[entry["id"]] = (updated, {"id": entry["id"], "title": title, "body": body})
+    return [note for _, note in sorted(by_id.values(), key=lambda pair: pair[1]["id"])]
+
+
+def post_named_note(date_str, key, display_name, surface, text, page_png=None, idem_key=None):
+    """Mirror a named working surface (Synthesize topic page, Grid/Jot page, Text Note)
+    to mjh.yoga /notes/.
 
     These are working pages, not field-journal entries, so they go to /notes/ only —
     tagged by surface and titled with the board's name so a renamed page stays findable.
     idem_key is the page key, so re-processing a day updates rather than duplicates.
+    Callers whose keys don't follow the Synthesize default-key convention (Grid/Jot
+    daily pages, whose bare key repeats every day) pass an explicit idem_key.
     """
     if not NOTES_INGEST_SECRET:
         log.warning("No NOTES_INGEST_SECRET set; skipping %s note for %s", surface, key)
@@ -1145,7 +1262,7 @@ def post_named_note(date_str, key, display_name, surface, text, page_png=None):
         # A NAMED page's key already carries its own millis stamp, so it is unique on its
         # own and stable across days. The DEFAULT page's key is the bare surface name, which
         # would collide every day — so date-stamp that one.
-        "idem_key": ("%s-%s" % (surface.lower(), date_str)) if key == surface.lower() else key,
+        "idem_key": idem_key or (("%s-%s" % (surface.lower(), date_str)) if key == surface.lower() else key),
     }
     try:
         r = requests.post(
@@ -1429,6 +1546,16 @@ def process_day(merged_data, label):
         t_ts = int(_dt(year, month, day, 12, 0, tzinfo=_tz.utc).timestamp())
         post_text_elements(t_date, t_ts, text_elements)
 
+    # Typed Text Notes (text-notes/notes-<date>.json sidecars) — already text, no OCR.
+    # Also BEFORE the stroke guard: a day can hold typed notes and no ink at all.
+    # Each note is its own /notes draft via the named-note seam; idem_key is the note's
+    # own id, which is minted once and never re-minted, so a re-run (or an edit — the
+    # notes participate in the day's change-hash in main()) updates in place.
+    # day_text_notes never raises on bad files, so a malformed note can't fail the day.
+    for tn in day_text_notes(f"{year:04d}-{month:02d}-{day:02d}"):
+        post_named_note(f"{year:04d}-{month:02d}-{day:02d}", tn["id"], tn["title"],
+                        "Text Note", tn["body"], idem_key=tn["id"])
+
     # Flatten calendarStrokes
     all_cal = []
     for style_strokes in (data.get("calendarStrokes") or {}).values():
@@ -1487,10 +1614,12 @@ def process_day(merged_data, label):
     if note_page_texts:
         payload["note_page_texts"] = note_page_texts
         # Display names for named surfaces, so downstream shows "Android" rather than the
-        # opaque key "pickings-1784498609355".
+        # opaque key "pickings-1784498609355". Indexes are keyed by BASE key, so a
+        # sub-page ("grid#1", "grid-<millis>#2") inherits its document's name.
         _names = named_page_names(f"{year:04d}-{month:02d}-{day:02d}")
         if _names:
-            payload["note_page_names"] = {k: v for k, v in _names.items() if k in note_page_texts}
+            _paged = {k: (_names.get(k) or _names.get(base_page_key(k))) for k in note_page_texts}
+            payload["note_page_names"] = {k: v for k, v in _paged.items() if v is not None}
 
     # On-device structured items (dual-face task/event). Forward ONLY the user-curated
     # lasso/vision items — the ambient "auto" whole-section OCR is noisier than this
@@ -1602,11 +1731,25 @@ def process_day(merged_data, label):
         post_named_note(pdate, skey, surface_names.get(skey, ""), "Synthesize",
                         note_page_texts.get(skey) or "")
 
+    # Grid and Jot pages -> mjh.yoga /notes/, the Synthesize seam exactly. Both are
+    # sub-pageable ("grid#1", "sketch-<millis>#2"), so the name is looked up by the
+    # BASE key — a document's sub-pages share its name — and the idem_key is
+    # date-stamped for the daily page's keys only (see document_idem_key). Jot posts
+    # under the surface Michael names ("Jot"); its keys keep their historic "sketch"
+    # spelling, which is the wire format, not a label.
+    for surface, default_key, matcher in (("Grid", "grid", is_grid_key),
+                                          ("Jot", "sketch", is_sketch_key)):
+        for gkey in sorted(k for k in note_strokes_by_page if matcher(k)):
+            post_named_note(pdate, gkey, surface_names.get(base_page_key(gkey), ""), surface,
+                            note_page_texts.get(gkey) or "",
+                            idem_key=document_idem_key(default_key, gkey, pdate))
+
     # Anything else that carries ink under a key nothing above claims: log it by name so a
     # future named surface can never again go missing in silence.
     _claimed = {"gratitude", "intake", "0", "1", "2", "3"}
     for okey in sorted(note_strokes_by_page):
-        if is_pickings_key(okey) or is_synth_key(okey) or okey in _claimed or okey.isdigit():
+        if (is_pickings_key(okey) or is_synth_key(okey) or is_grid_key(okey)
+                or is_sketch_key(okey) or okey in _claimed or okey.isdigit()):
             continue
         log.info(f"Note page '{okey}'"
                  + (f" ('{surface_names[okey]}')" if surface_names.get(okey) else "")
@@ -1854,6 +1997,16 @@ def main():
         # re-hash and re-OCR all history once), and image edits ride along with the page's
         # stroke edits anyway — so existing days keep their original hash.
         hashable = {k: v for k, v in merged.items() if k != "imageElements"}
+        # Text Notes live in their own sidecar files (text-notes/notes-<date>.json), not
+        # in the day JSON, so nothing above can see them change: they have to be folded
+        # into the hashable input DELIBERATELY or an edited note would never re-trigger
+        # the day. No other non-day-file input does this — the name indexes stay out on
+        # purpose (a rename alone isn't worth a full re-OCR of the day). Added only when
+        # the day has notes, so all history without them keeps its original hash.
+        _day_match = re.search(r"day-(\d{4}-\d{2}-\d{2})", name)
+        _tnotes = day_text_notes(_day_match.group(1)) if _day_match else []
+        if _tnotes:
+            hashable["textNotes"] = _tnotes
         merged_bytes = json.dumps(hashable, sort_keys=True, default=str).encode()
         merged_hash = hashlib.sha256(merged_bytes).hexdigest()
 
