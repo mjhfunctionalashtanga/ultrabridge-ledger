@@ -22,7 +22,7 @@ import base64
 import logging
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,15 +41,6 @@ WEBDAV_JSON_DIR = os.environ.get(
 LEDGER_DATA_ROOT = os.environ.get(
     "LEDGER_DATA_ROOT",
     "/docker/ultrabridge/ultrabridge-data",
-)
-# The media store for by-reference day-JSON payloads (WIRE-MEDIA-BY-REFERENCE.md): once the
-# devices externalize images, an element carries data="" plus dataRef="<sha256>.<png|jpg>"
-# and the bytes live in a media/ dir the devices sync alongside calendar/. On the dav tree
-# that is <root>/media, two levels up from the json dir (…/data/ToolsForBoox/json → …/data/media),
-# which is why the default is derived rather than fixed. Env-overridable like the dirs above.
-LEDGER_MEDIA_DIR = os.environ.get(
-    "LEDGER_MEDIA_DIR",
-    os.path.normpath(os.path.join(WEBDAV_JSON_DIR, "..", "..", "media")),
 )
 STATE_FILE = os.environ.get(
     "LEDGER_STATE_FILE",
@@ -72,6 +63,11 @@ SOCIAL_ARCHIVE_URL = os.environ.get("SOCIAL_ARCHIVE_URL", "https://michaeljoelha
 SOCIAL_ARCHIVE_SECRET = os.environ.get("SOCIAL_ARCHIVE_SECRET", "")
 NOTES_CREATE_TAGGED_URL = os.environ.get("NOTES_CREATE_TAGGED_URL", "https://mjh.yoga/wp-json/mjh/v1/notes/create-tagged")
 NOTES_INGEST_SECRET = os.environ.get("NOTES_INGEST_SECRET", "")
+
+# POSSE queue (mjh-syndication.php). Used ONLY to hold entries back from Bluesky, never to post:
+# a Pickings day writes four part-entries plus the assembled page, and only the page should go out.
+SYNDICATION_ACK_URL = os.environ.get("SYNDICATION_ACK_URL", "https://michaeljoelhall.com/wp-json/mjh/v1/syndicate-ack")
+SYNDICATION_SECRET = os.environ.get("SYNDICATION_SECRET", "")
 
 # --- Grid constants (from CalendarDayPage.kt) ---
 PAGE_W, PAGE_H = 1404, 1872
@@ -736,31 +732,6 @@ def texts_in_box(texts, box):
     return "\n\n".join(p[2] for p in picked)
 
 
-def ledger_image_b64(ie):
-    """An image element's pixels, as base64 — from either face of the two-faced wire
-    (WIRE-MEDIA-BY-REFERENCE.md, both device repos): inline in `data`, or in a media-store
-    file named by `dataRef` (<sha256-of-bytes>.<png|jpg>) once the devices externalize.
-    Inline wins when both appear. A missing or malformed ref returns None — the image is
-    skipped and logged, never fatal, so an errored blob can't fail the day (the
-    processed[name] success-path contract stays intact)."""
-    b64 = ie.get("data")
-    if b64:
-        return b64
-    ref = ie.get("dataRef") or ""
-    if not ref:
-        return None
-    stem, _, ext = ref.partition(".")
-    if len(stem) != 64 or ext not in ("png", "jpg") or any(c not in "0123456789abcdef" for c in stem):
-        log.warning(f"Malformed dataRef skipped: {ref!r}")
-        return None
-    path = Path(LEDGER_MEDIA_DIR) / ref
-    try:
-        return base64.b64encode(path.read_bytes()).decode()
-    except OSError as e:
-        log.warning(f"Media blob missing for dataRef {ref}: {e}")
-        return None
-
-
 def render_pickings_box(box, strokes, images, scale=2):
     """Flatten everything filling one Pickings image tile — any pasted image(s) PLUS the
     ink strokes drawn in or on top of them — into a single cropped PNG. Returns bytes or
@@ -772,7 +743,7 @@ def render_pickings_box(box, strokes, images, scale=2):
 
     # 1) Paste any images at their position relative to the box.
     for ie in images or []:
-        b64 = ledger_image_b64(ie)
+        b64 = ie.get("data")
         if not b64:
             continue
         try:
@@ -824,6 +795,213 @@ def strokes_in_box(strokes, box):
     return out
 
 
+# ---------------------------------------------------------------------------
+# The assembled Pickings page as ONE picture (for POSSE / Bluesky)
+#
+# michaeljoelhall.com builds the Pickings "look" in HTML and CSS — see
+# mjh_journal_render_ledger_storycard() in mjh-social-archive.php — by laying the day's four
+# SEPARATE entries (Notes, Quotes, Image 1, Image 2) two-up on a cream plate. That look exists
+# only in a browser: there is no single picture of it anywhere. Bluesky can carry a picture and
+# nothing else, and mjh-syndication.php's pickings branch reads _social_media[0]['url'], so
+# without a render of the whole board a syndicated picking goes out as bare text and a link.
+# These constants borrow the storycard's own palette and two-column shape so the thing that
+# lands on Bluesky and the thing on the website read as the same object.
+# ---------------------------------------------------------------------------
+PICKINGS_PAGE_W = 1200               # ~2x Bluesky's in-feed display width, so it survives the downscale
+PICKINGS_PAGE_PAD = 40
+PICKINGS_PAGE_GAP = 24
+PICKINGS_PAGE_INSET = 7              # the mat around each plate (the card's 4px border + 1px outline)
+PICKINGS_PAGE_LABEL_H = 34
+PICKINGS_PAGE_HEAD_H = 66
+PICKINGS_PAGE_MAX_CELL_H = 700       # holds the finished page near 3:4, which Bluesky shows uncropped
+PICKINGS_PAGE_TRIM_MARGIN = 18       # air left around the ink when a cell is cropped to its content
+PICKINGS_PAGE_BYTE_BUDGET = 950000   # see _encode_within_budget: the PDS refuses a blob over ~1MB
+
+# Storycard palette (mjh-social-archive.php): page #fbf7ec on #d9c9a3, plates #fff8ec on #b89a55,
+# labels in the rust #8a3a2b, the header rule in the ochre #a98e3f.
+_PAGE_BG, _PAGE_EDGE = (251, 247, 236), (217, 201, 163)
+_PLATE_BG, _PLATE_EDGE = (255, 248, 236), (184, 154, 85)
+_LABEL_INK, _HEAD_INK = (138, 58, 43), (169, 142, 63)
+
+
+def _page_font(size, bold=False):
+    """DejaVu at a given size, falling back to PIL's bitmap default like render_full_page does."""
+    face = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/" + face, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _trim_to_content(png_data, margin=PICKINGS_PAGE_TRIM_MARGIN):
+    """Crop one rendered Pickings cell down to the ink and photos actually in it.
+
+    A Notes column is a 644x1090 zone that on most days holds six lines of handwriting near the
+    top. Dropping that whole mostly-empty zone into the composite would shrink the writing to
+    nothing at the size Bluesky shows an image in the feed — and the render has to be readable as
+    a THUMBNAIL, not only when someone taps it. Cropping to content is what buys that: a sparse
+    day's few lines end up filling their plate instead of floating in white.
+
+    Returns a PIL image, uncropped when the cell is uniform or the bounding box comes back
+    degenerate (render_pickings_box already declines to emit a wholly empty cell).
+    """
+    img = Image.open(BytesIO(png_data)).convert("RGB")
+    bbox = ImageChops.difference(img, Image.new("RGB", img.size, (255, 255, 255))).getbbox()
+    if not bbox:
+        return img
+    left = max(0, bbox[0] - margin)
+    top = max(0, bbox[1] - margin)
+    right = min(img.width, bbox[2] + margin)
+    bottom = min(img.height, bbox[3] + margin)
+    if right - left < 8 or bottom - top < 8:
+        return img
+    return img.crop((left, top, right, bottom))
+
+
+def _encode_within_budget(img, budget=PICKINGS_PAGE_BYTE_BUDGET):
+    """Encode the composite as PNG if it fits the budget, otherwise as progressively cheaper JPEG.
+
+    The Bluesky poster (/opt/reading-digest/bsky_poster.py) fetches the media URL and hands the
+    bytes to upload_blob verbatim — it never resizes — and the PDS rejects a blob over ~1MB. A
+    Pickings page carrying two photographs sails past that as PNG, and the failure surfaces only
+    as an exception line in the syndication cron, so the ceiling is enforced here at render time
+    where it can still be fixed. Line-art-only pages stay lossless PNG; photo-heavy ones give up
+    a little fidelity rather than silently failing to post.
+
+    Returns (bytes, "png" | "jpg").
+    """
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    if buf.tell() <= budget:
+        return buf.getvalue(), "png"
+    for quality in (88, 80, 72, 62):
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+        if buf.tell() <= budget:
+            return buf.getvalue(), "jpg"
+    # Still too heavy. Halve the canvas: a slightly soft page that actually posts beats a crisp
+    # one the PDS refuses, and this only ever bites a board with two large photographs on it.
+    small = img.resize((max(1, img.width // 2), max(1, img.height // 2)), Image.LANCZOS)
+    buf = BytesIO()
+    small.save(buf, format="JPEG", quality=70, optimize=True, progressive=True)
+    return buf.getvalue(), "jpg"
+
+
+def render_pickings_page(date_str, cells, board_name="", width=PICKINGS_PAGE_W):
+    """Assemble one day's Pickings board into a single picture of the page.
+
+    cells is the board in device order — [(label, png_or_None)] for NOTES, QUOTES, IMAGE 1,
+    IMAGE 2 — and the layout keeps that order: the two text columns on top, the two image tiles
+    beneath, exactly where they sit on the Boox. MJH: "the notes and quotes and image 1 and image
+    2 used on michaeljoelhall.com and put together to resemble the pickings page."
+
+    A partial board is the normal case, not an error — plenty of days are a note and one photo —
+    so absent cells are dropped rather than reserved: a row left with one survivor spans the full
+    width, a row left with none is omitted entirely, and an empty board renders nothing at all
+    rather than an empty frame. What publishes is the page as far as it was actually filled in.
+
+    Each plate hugs its own fitted picture instead of being a fixed rectangle, which is the other
+    half of that honesty: a short cell leaves no hollow border around itself.
+
+    Returns (bytes, "png" | "jpg", (w, h)), or None when the board carries nothing.
+    """
+    rows = []
+    for pair in (cells[:2], cells[2:4]):
+        row = [(label, _trim_to_content(png)) for label, png in pair if png]
+        if row:
+            rows.append(row)
+    if not rows:
+        return None
+
+    inner = width - 2 * PICKINGS_PAGE_PAD
+    avail_h = PICKINGS_PAGE_MAX_CELL_H - 2 * PICKINGS_PAGE_INSET
+    laid = []
+    for row in rows:
+        cell_w = inner if len(row) == 1 else (inner - PICKINGS_PAGE_GAP) // 2
+        avail_w = cell_w - 2 * PICKINGS_PAGE_INSET
+        fitted = []
+        for label, img in row:
+            # Never magnify past what was rendered. A cell holding real work always trims to
+            # something wider than its column and so scales DOWN; only a scrap ever wants scaling
+            # up, and a scrap magnified to fill the plate reads as a page full of one squiggle.
+            k = min(avail_w / float(img.width), avail_h / float(img.height), 1.0)
+            fitted.append((label, img.resize((max(1, int(img.width * k)), max(1, int(img.height * k))),
+                                             Image.LANCZOS)))
+        laid.append((cell_w, fitted, max(f[1].height for f in fitted)))
+
+    total_h = PICKINGS_PAGE_PAD + PICKINGS_PAGE_HEAD_H
+    for _cw, _fitted, plate_h in laid:
+        total_h += PICKINGS_PAGE_LABEL_H + plate_h + 2 * PICKINGS_PAGE_INSET + PICKINGS_PAGE_GAP
+    total_h += PICKINGS_PAGE_PAD - PICKINGS_PAGE_GAP
+
+    page = Image.new("RGB", (width, total_h), _PAGE_BG)
+    draw = ImageDraw.Draw(page)
+    draw.rectangle([0, 0, width - 1, total_h - 1], outline=_PAGE_EDGE, width=2)
+
+    # A renamed board can carry a whole headline as its name — one real board is called "Rise in
+    # overseas surrogates 'increases risk of stateless babies'" — and at a fixed size that ran
+    # straight off the right edge. Step the size down first, then clip the name from the end, so
+    # the part that gets lost is always the tail of the title and never the date.
+    label_board = (board_name or "").strip()
+    head_stem = "PICKINGS · %s" % date_str
+    head = head_stem + ((" · " + label_board) if label_board and label_board.lower() != "pickings" else "")
+    head_max = width - 2 * PICKINGS_PAGE_PAD
+    head_size = 38
+    for head_size in (38, 34, 30, 26):
+        head_font = _page_font(head_size, bold=True)
+        if draw.textlength(head, font=head_font) <= head_max:
+            break
+    while len(head) > len(head_stem) + 4 and draw.textlength(head, font=head_font) > head_max:
+        head = head[:-2] + "…"
+    draw.text((PICKINGS_PAGE_PAD, PICKINGS_PAGE_PAD - 4 + (38 - head_size) // 2), head,
+              font=head_font, fill=_HEAD_INK)
+    rule_y = PICKINGS_PAGE_PAD + 50
+    draw.line([(PICKINGS_PAGE_PAD, rule_y), (width - PICKINGS_PAGE_PAD, rule_y)], fill=_PAGE_EDGE, width=1)
+
+    label_font = _page_font(23, bold=True)
+    y = PICKINGS_PAGE_PAD + PICKINGS_PAGE_HEAD_H
+    for cell_w, fitted, plate_h in laid:
+        x = PICKINGS_PAGE_PAD
+        for label, img in fitted:
+            plate_w = img.width + 2 * PICKINGS_PAGE_INSET
+            plate_x = x + (cell_w - plate_w) // 2  # centre each plate inside its column
+            draw.text((plate_x, y), label.upper(), font=label_font, fill=_LABEL_INK)
+            plate_y = y + PICKINGS_PAGE_LABEL_H
+            draw.rectangle([plate_x, plate_y, plate_x + plate_w - 1,
+                            plate_y + img.height + 2 * PICKINGS_PAGE_INSET - 1],
+                           fill=_PLATE_BG, outline=_PLATE_EDGE, width=1)
+            page.paste(img, (plate_x + PICKINGS_PAGE_INSET, plate_y + PICKINGS_PAGE_INSET))
+            x += cell_w + PICKINGS_PAGE_GAP
+        y += PICKINGS_PAGE_LABEL_H + plate_h + 2 * PICKINGS_PAGE_INSET + PICKINGS_PAGE_GAP
+
+    data, ext = _encode_within_budget(page)
+    return data, ext, page.size
+
+
+def synd_suppress_from_queue(post_id, why):
+    """Take a journal entry out of the POSSE queue without ever posting it to Bluesky.
+
+    mjh-syndication.php queues EVERY unsyndicated social_archive entry whose platform is in the
+    site's source list, and a Pickings day writes four of them (Notes, Quotes, Image 1, Image 2)
+    plus the assembled page. Left alone that is five Bluesky posts for one board. Michael wants
+    the page — one post of the thing he actually made — so the four parts are acked as handled
+    the moment they are created, seconds after the ingest returns their post_id and well inside
+    the 30-minute syndication cron's window.
+
+    _bsky_posted is the same flag used to baseline the 86 pre-existing Pickings entries, and
+    syndicate-ack only ever SETS it — nothing here can un-baseline history or re-post it.
+    """
+    if not (SYNDICATION_SECRET and post_id):
+        return
+    try:
+        r = requests.post(SYNDICATION_ACK_URL, json={"post_id": int(post_id)},
+                          headers={"X-MF-Secret": SYNDICATION_SECRET, "Content-Type": "application/json"},
+                          timeout=30)
+        log.info("Syndication: held back %s (post_id=%s): %s", why, post_id, r.status_code)
+    except Exception as e:
+        log.error("Syndication hold-back failed for %s (post_id=%s): %s", why, post_id, e)
+
+
 def post_doodle(date_str, timestamp, doodle_png):
     """Post the gratitude-page doodle to the journal (michaeljoelhall.com) as an image entry.
     Journal-only: the mjh.yoga sketch note already rides the webhook (sketch_png_b64)."""
@@ -854,8 +1032,99 @@ def post_doodle(date_str, timestamp, doodle_png):
         log.error(f"Doodle journal post failed: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Named surfaces (renamed / extra Pickings boards, named Synthesize topic pages)
+#
+# The device stores a surface's ink in the day JSON under a note-page KEY. The default
+# board keeps the legacy key ("pickings" / "synthesize"), but adding or renaming one
+# mints a fresh key — PickingsStore uses "pickings-<millis>", SynthPageStore uses
+# "synthesize-<millis>" — and records the display name in a sidecar index:
+#
+#   <device>/<tree>/pickings-index/<YYYY-MM-DD>.json  -> [{"key","name"}]      (per day)
+#   <device>/<tree>/synth-index/pages.json            -> [{"key","name","date"}] (global)
+#
+# Matching only the legacy key meant a renamed board's content rode the day JSON under a
+# key nothing downstream recognised, and posted nowhere. Match the prefixes instead.
+# ---------------------------------------------------------------------------
+
+def is_pickings_key(key):
+    key = key or ""
+    return key == "pickings" or key.startswith("pickings-")
+
+
+def is_synth_key(key):
+    key = key or ""
+    return key == "synthesize" or key.startswith("synthesize-")
+
+
+def _read_json_file(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def named_page_names(date_str):
+    """note-page key -> display name, merged across every synced device tree.
+
+    Later trees win on conflict, which matches the device-side merge (a locally renamed
+    board keeps its local name). Missing/!unreadable indexes are simply skipped: a board
+    with no registry entry still syncs, just under its default label.
+    """
+    names = {}
+    root = Path(LEDGER_DATA_ROOT)
+    if not root.exists():
+        return names
+    for idx in sorted(root.glob("*/*/pickings-index/%s.json" % date_str)):
+        for entry in _read_json_file(str(idx), []) or []:
+            if isinstance(entry, dict) and entry.get("key"):
+                names[entry["key"]] = (entry.get("name") or "").strip()
+    for idx in sorted(root.glob("*/*/synth-index/pages.json")):
+        for entry in _read_json_file(str(idx), []) or []:
+            if isinstance(entry, dict) and entry.get("key") and str(entry.get("date") or "") == date_str:
+                names[entry["key"]] = (entry.get("name") or "").strip()
+    return names
+
+
+def post_named_note(date_str, key, display_name, surface, text, page_png=None):
+    """Mirror a named working surface (Synthesize topic page) to mjh.yoga /notes/.
+
+    These are working pages, not field-journal entries, so they go to /notes/ only —
+    tagged by surface and titled with the board's name so a renamed page stays findable.
+    idem_key is the page key, so re-processing a day updates rather than duplicates.
+    """
+    if not NOTES_INGEST_SECRET:
+        log.warning("No NOTES_INGEST_SECRET set; skipping %s note for %s", surface, key)
+        return
+    text = (text or "").strip()
+    if not text:
+        return
+    label = (display_name or "").strip()
+    # An unnamed default page needs no trailing "· Synthesize" repeating the surface.
+    label_suffix = " · %s" % label if label and label.lower() != surface.lower() else ""
+    html = "<p>" + text.replace("\n", "<br>") + "</p>"
+    body = {
+        "title": "%s — %s%s" % (surface, date_str, label_suffix),
+        "body": html,
+        "tags": [surface],
+        # A NAMED page's key already carries its own millis stamp, so it is unique on its
+        # own and stable across days. The DEFAULT page's key is the bare surface name, which
+        # would collide every day — so date-stamp that one.
+        "idem_key": ("%s-%s" % (surface.lower(), date_str)) if key == surface.lower() else key,
+    }
+    try:
+        r = requests.post(
+            NOTES_CREATE_TAGGED_URL, json=body,
+            headers={"X-MJH-Ingest-Secret": NOTES_INGEST_SECRET, "Content-Type": "application/json"},
+            timeout=30)
+        log.info("%s[%s '%s'] -> mjh.yoga note: %s", surface, key, label or surface, r.status_code)
+    except Exception as e:
+        log.error("%s note post failed for %s: %s", surface, key, e)
+
+
 def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
-                  notes_png=None, quotes_png=None):
+                  notes_png=None, quotes_png=None, board_suffix="", board_name=""):
     """Post a Pickings page to the journal (michaeljoelhall.com) + mirror to mjh.yoga /notes/.
     Notes and Quotes each become their OWN entry — the rendered handwriting image plus the
     OCR transcription as the caption — so the journal shows both in its own box."""
@@ -866,6 +1135,20 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
 
     notes_text = (notes_text or "").strip()
     quotes_text = (quotes_text or "").strip()
+
+    # Per-board identity. The DEFAULT board passes no suffix and no name, so its source_ids,
+    # titles, filenames and idem_key stay byte-identical to before this change — existing
+    # entries keep updating in place instead of forking into duplicates.
+    sid = "pickings-%s%s" % (date_str, ("-" + board_suffix) if board_suffix else "")
+    board_label = (board_name or "").strip()
+    is_named = bool(board_label) and board_label.lower() != "pickings"
+    title_stem = "Pickings \u00b7 %s%s" % (date_str, (" \u00b7 " + board_label) if is_named else "")
+    note_title = "Pickings \u2014 %s%s" % (date_str, (" \u00b7 " + board_label) if is_named else "")
+    board_tags = [board_label] if is_named else []
+
+    if not SYNDICATION_SECRET:
+        log.warning("No SYNDICATION_SECRET set; the Pickings part-entries cannot be held back from "
+                    "the POSSE queue, so this board will syndicate as several Bluesky posts, not one")
 
     # Pickings = 4 independent items per day (Notes, Quotes, Image 1, Image 2).
     # The notes/quotes PNGs already include any images placed inside their own boxes
@@ -878,20 +1161,22 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
         media = []
         if png:
             media.append({"data_base64": base64.b64encode(png).decode(), "kind": "image",
-                          "filename": f"pickings-{date_str}-{kind}.png"})
+                          "filename": f"{sid}-{kind}.png"})
         body = {
             "platform": "pickings", "type": "note",
-            "source_id": f"pickings-{date_str}-{kind}", "timestamp": timestamp,
-            "title": f"Pickings · {date_str} — {label}",
-            "caption": text, "media": media, "tags": ["pickings", kind],
+            "source_id": f"{sid}-{kind}", "timestamp": timestamp,
+            "title": f"{title_stem} — {label}",
+            "caption": text, "media": media, "tags": ["pickings", kind] + board_tags,
         }
         try:
             r = requests.post(SOCIAL_ARCHIVE_URL, json=body, headers=headers, timeout=90)
             log.info(f"Pickings {kind} -> journal: {r.status_code}")
             if r.ok:
-                for m in (r.json().get("media") or []):
+                payload = r.json()
+                for m in (payload.get("media") or []):
                     if m.get("url"):
                         hand_urls[kind] = m["url"]
+                synd_suppress_from_queue(payload.get("post_id"), f"pickings {kind} {sid}")
         except Exception as e:
             log.error(f"Pickings {kind} post failed: {e}")
 
@@ -900,28 +1185,89 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
     # (MJH: the pasted text should ride ON the image AND stand alone as the quote).
     image_urls = []  # (url, caption) so the mjh.yoga mirror can show the caption under each image
     for i, ie in enumerate(image_elements, 1):
-        b64 = ledger_image_b64(ie)
+        b64 = ie.get("data")
         if not b64:
             continue
         cap = (ie.get("caption") or "").strip()
         body = {
             "platform": "pickings", "type": "image",
-            "source_id": f"pickings-{date_str}-img{i}", "timestamp": timestamp,
-            "title": f"Pickings · {date_str}", "caption": cap,
-            "media": [{"data_base64": b64, "kind": "image", "filename": f"pickings-{date_str}-{i}.png"}],
-            "tags": ["pickings"],
+            "source_id": f"{sid}-img{i}", "timestamp": timestamp,
+            "title": title_stem, "caption": cap,
+            "media": [{"data_base64": b64, "kind": "image", "filename": f"{sid}-{i}.png"}],
+            "tags": ["pickings"] + board_tags,
         }
         try:
             r = requests.post(SOCIAL_ARCHIVE_URL, json=body, headers=headers, timeout=90)
             log.info(f"Pickings image {i} -> journal: {r.status_code}")
             if r.ok:
-                for m in (r.json().get("media") or []):
+                payload = r.json()
+                for m in (payload.get("media") or []):
                     if m.get("url"):
                         image_urls.append((m["url"], cap))
+                synd_suppress_from_queue(payload.get("post_id"), f"pickings image {i} {sid}")
         except Exception as e:
             log.error(f"Pickings image {i} post failed: {e}")
 
-    # 3) Mirror to mjh.yoga /notes/ as one Pickings note (handwriting + text + images)
+    # 3) The assembled page -> its OWN entry, and the only one of the day left in the POSSE queue.
+    # The composite is the page, not each picking: the four entries above are the parts the site
+    # arranges into a storycard, and this is one picture of that arrangement, so a Bluesky post
+    # carries what Michael actually made rather than one cell of it. It is built from the very
+    # same PNGs those entries carry, so the picture can never drift from the parts.
+    #
+    # A partial board still makes a page — a note and one photo is a normal day. A board holding
+    # only stray marks does not: 2026-07-28 left a single 63x52 squiggle on the Quotes zone, and
+    # composing that would publish, and syndicate, a page of one accidental pen stroke. So the
+    # board has to hold a picture or something that read back as words before it is worth a page.
+    legible = [t for t in (notes_text, quotes_text) if t and t.strip().lower() != "[illegible]"]
+    page_cells = [("Notes", notes_png), ("Quotes", quotes_png)]
+    for i, ie in enumerate(image_elements[:2], 1):
+        raw = ie.get("data")
+        page_cells.append(("Image %d" % i, base64.b64decode(raw) if raw else None))
+    if not (image_elements or legible):
+        log.info("Pickings page %s-page: board holds no picture and nothing legible; not composing", sid)
+        page = None
+    else:
+        page = render_pickings_page(date_str, page_cells, board_name=board_label)
+    if page:
+        page_bytes, page_ext, (page_w, page_h) = page
+        page_sid = "%s-page" % sid
+        page_hash = hashlib.sha256(page_bytes).hexdigest()
+        # Idempotency has to hold at the byte level, not just at the entry level. The journal
+        # dedups on source_id so the ENTRY is never doubled, but mjh_social_archive_upload_base64()
+        # runs wp_upload_bits() on every ingest — re-posting an unchanged page would mint a fresh
+        # attachment each pass and orphan the last, and this runs on a 15-minute cron where any
+        # unrelated edit elsewhere on the day re-triggers process_day. So a day whose page render
+        # is byte-identical to the one already published is simply not sent.
+        if (load_state().get("pickings_page_sent") or {}).get(page_sid) == page_hash:
+            log.info("Pickings page %s unchanged (%s…); not re-uploading", page_sid, page_hash[:12])
+        else:
+            page_body = {
+                "platform": "pickings", "type": "image",
+                "source_id": page_sid, "timestamp": timestamp,
+                "title": title_stem,
+                "caption": "\n\n".join(t for t in (notes_text, quotes_text) if t),
+                "media": [{"data_base64": base64.b64encode(page_bytes).decode(), "kind": "image",
+                           "filename": "%s.%s" % (page_sid, page_ext)}],
+                # The "page" tag is what keeps the composite out of the site's own storycard and
+                # email-digest buckets, which already show its four parts — it exists to BE the
+                # picture that syndicates, not to be a fifth plate on the day's card.
+                "tags": ["pickings", "page"] + board_tags,
+            }
+            try:
+                r = requests.post(SOCIAL_ARCHIVE_URL, json=page_body, headers=headers, timeout=120)
+                log.info("Pickings page -> journal: %s (%dx%d, %d bytes %s, cells=%s)",
+                         r.status_code, page_w, page_h, len(page_bytes), page_ext,
+                         [lbl for lbl, png in page_cells if png])
+                if r.ok:
+                    # Re-load and merge so the end-of-run save in main() clobbers no key written
+                    # mid-run elsewhere (same pattern as tasks_sent / intake_sent).
+                    latest = load_state()
+                    latest.setdefault("pickings_page_sent", {})[page_sid] = page_hash
+                    save_state(latest)
+            except Exception as e:
+                log.error("Pickings page post failed: %s", e)
+
+    # 4) Mirror to mjh.yoga /notes/ as one Pickings note (handwriting + text + images)
     if NOTES_INGEST_SECRET and (notes_text or quotes_text or image_urls):
         html = []
         if notes_text or hand_urls.get("notes"):
@@ -944,10 +1290,10 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
             html.append("</figure>")
         html.append(f'<p><a href="https://michaeljoelhall.com/journal/{date_str}/">View in the journal &rarr;</a></p>')
         note_body = {
-            "title": f"Pickings — {date_str}",
+            "title": note_title,
             "body": "".join(html),
-            "tags": ["Pickings"],
-            "idem_key": f"pickings-{date_str}",
+            "tags": ["Pickings"] + board_tags,
+            "idem_key": sid,
         }
         try:
             r = requests.post(
@@ -1106,6 +1452,11 @@ def process_day(merged_data, label):
 
     if note_page_texts:
         payload["note_page_texts"] = note_page_texts
+        # Display names for named surfaces, so downstream shows "Android" rather than the
+        # opaque key "pickings-1784498609355".
+        _names = named_page_names(f"{year:04d}-{month:02d}-{day:02d}")
+        if _names:
+            payload["note_page_names"] = {k: v for k, v in _names.items() if k in note_page_texts}
 
     # On-device structured items (dual-face task/event). Forward ONLY the user-curated
     # lasso/vision items — the ambient "auto" whole-section OCR is noisier than this
@@ -1144,54 +1495,89 @@ def process_day(merged_data, label):
                 dts = int(time.time())
             post_doodle(ddate, dts, doodle_png)
 
-    # Pickings page -> journal (michaeljoelhall.com) + mjh.yoga /notes/
-    pickings_strokes = note_strokes_by_page.get("pickings") or []
-    pickings_images = [ie for ie in (data.get("imageElements") or []) if ie.get("page") == "pickings"]
-    pickings_texts = [te for te in (data.get("textElements") or []) if te.get("pageKey") == "pickings"]
-    if pickings_strokes or pickings_images or pickings_texts:
-        notes_zone   = strokes_in_box(pickings_strokes, PICKINGS_NOTES_BOX)
-        quotes_zone  = strokes_in_box(pickings_strokes, PICKINGS_QUOTES_BOX)
-        # Images placed WITHIN the notes/quotes boxes themselves (a quote can be an image
-        # at the top + handwriting below — both belong to the same composite).
-        notes_imgs   = images_in_box(pickings_images, PICKINGS_NOTES_BOX)
-        quotes_imgs  = images_in_box(pickings_images, PICKINGS_QUOTES_BOX)
-        notes_text   = ocr_note_page(render_note_page(notes_zone, scale=2)) if notes_zone else ""
-        quotes_text  = ocr_note_page(render_note_page(quotes_zone, scale=2)) if quotes_zone else ""
-        # Pasted (digital) text per zone — already text, so no OCR. Fold it into each zone's
-        # transcription (pasted first, handwriting after) so the standalone Notes/Quotes
-        # journal entries carry it. The Quotes-zone pasted text is ALSO used to caption the
-        # image tiles below — MJH wants a pasted quote to ride ON the picture, not only as
-        # its own quote card.
-        notes_pasted  = texts_in_box(pickings_texts, PICKINGS_NOTES_BOX)
-        quotes_pasted = texts_in_box(pickings_texts, PICKINGS_QUOTES_BOX)
-        notes_text  = "\n\n".join(t for t in (notes_pasted, notes_text) if t)
-        quotes_text = "\n\n".join(t for t in (quotes_pasted, quotes_text) if t)
-        # The caption that rides on each image tile: prefer text pasted inside that tile,
-        # else the page's quote (pasted preferred, else the handwritten quote transcription).
-        shared_img_caption = quotes_pasted or quotes_text
-        # Composite (strokes + in-box images) for each text zone.
-        notes_png = (render_pickings_box(PICKINGS_NOTES_BOX, notes_zone, notes_imgs, scale=2)
-                     if (notes_zone or notes_imgs) else None)
-        quotes_png = (render_pickings_box(PICKINGS_QUOTES_BOX, quotes_zone, quotes_imgs, scale=2)
-                      if (quotes_zone or quotes_imgs) else None)
-        from datetime import datetime, timezone
-        pdate = f"{year:04d}-{month:02d}-{day:02d}"
-        try:
-            pts = int(datetime(year, month, day, 12, 0, tzinfo=timezone.utc).timestamp())
-        except Exception:
-            pts = int(time.time())
-        # Each image tile -> one flattened composite (pasted photo(s) + ink drawn on/in it).
-        box_images = []
-        for box in (PICKINGS_IMAGE_BOX_1, PICKINGS_IMAGE_BOX_2):
-            b_imgs = images_in_box(pickings_images, box)
-            b_strokes = strokes_in_box(pickings_strokes, box)
-            png = render_pickings_box(box, b_strokes, b_imgs, scale=2)
-            if png:
-                b_caption = texts_in_box(pickings_texts, box) or shared_img_caption
-                box_images.append({"data": base64.b64encode(png).decode(), "caption": b_caption})
-        log.info(f"Pickings for {label}: notes_zone={len(notes_zone)} quotes_zone={len(quotes_zone)} "
-                 f"tiles={len(box_images)} pasted(notes={len(notes_pasted)},quotes={len(quotes_pasted)})")
-        post_pickings(pdate, pts, box_images, notes_text or "", quotes_text or "", notes_png, quotes_png)
+    # Pickings pages -> journal (michaeljoelhall.com) + mjh.yoga /notes/
+    # A day can hold several boards: the default "pickings" plus any named/renamed board
+    # ("pickings-<millis>"). Walk every one of them — matching only the default key is what
+    # made a renamed board stop posting with no error and no log line.
+    pdate = f"{year:04d}-{month:02d}-{day:02d}"
+    surface_names = named_page_names(pdate)
+    _all_images = data.get("imageElements") or []
+    _all_texts = data.get("textElements") or []
+    pickings_keys = {k for k in note_strokes_by_page if is_pickings_key(k)}
+    pickings_keys |= {ie.get("page") for ie in _all_images if is_pickings_key(ie.get("page"))}
+    pickings_keys |= {te.get("pageKey") for te in _all_texts if is_pickings_key(te.get("pageKey"))}
+    # Default board first, then named boards oldest-first (the key carries a millis stamp).
+    for pkey in sorted(pickings_keys, key=lambda k: (k != "pickings", k)):
+        pickings_strokes = note_strokes_by_page.get(pkey) or []
+        pickings_images = [ie for ie in _all_images if ie.get("page") == pkey]
+        pickings_texts = [te for te in _all_texts if te.get("pageKey") == pkey]
+        if pickings_strokes or pickings_images or pickings_texts:
+            notes_zone   = strokes_in_box(pickings_strokes, PICKINGS_NOTES_BOX)
+            quotes_zone  = strokes_in_box(pickings_strokes, PICKINGS_QUOTES_BOX)
+            # Images placed WITHIN the notes/quotes boxes themselves (a quote can be an image
+            # at the top + handwriting below — both belong to the same composite).
+            notes_imgs   = images_in_box(pickings_images, PICKINGS_NOTES_BOX)
+            quotes_imgs  = images_in_box(pickings_images, PICKINGS_QUOTES_BOX)
+            notes_text   = ocr_note_page(render_note_page(notes_zone, scale=2)) if notes_zone else ""
+            quotes_text  = ocr_note_page(render_note_page(quotes_zone, scale=2)) if quotes_zone else ""
+            # Pasted (digital) text per zone — already text, so no OCR. Fold it into each zone's
+            # transcription (pasted first, handwriting after) so the standalone Notes/Quotes
+            # journal entries carry it. The Quotes-zone pasted text is ALSO used to caption the
+            # image tiles below — MJH wants a pasted quote to ride ON the picture, not only as
+            # its own quote card.
+            notes_pasted  = texts_in_box(pickings_texts, PICKINGS_NOTES_BOX)
+            quotes_pasted = texts_in_box(pickings_texts, PICKINGS_QUOTES_BOX)
+            notes_text  = "\n\n".join(t for t in (notes_pasted, notes_text) if t)
+            quotes_text = "\n\n".join(t for t in (quotes_pasted, quotes_text) if t)
+            # The caption that rides on each image tile: prefer text pasted inside that tile,
+            # else the page's quote (pasted preferred, else the handwritten quote transcription).
+            shared_img_caption = quotes_pasted or quotes_text
+            # Composite (strokes + in-box images) for each text zone.
+            notes_png = (render_pickings_box(PICKINGS_NOTES_BOX, notes_zone, notes_imgs, scale=2)
+                         if (notes_zone or notes_imgs) else None)
+            quotes_png = (render_pickings_box(PICKINGS_QUOTES_BOX, quotes_zone, quotes_imgs, scale=2)
+                          if (quotes_zone or quotes_imgs) else None)
+            from datetime import datetime, timezone
+            try:
+                pts = int(datetime(year, month, day, 12, 0, tzinfo=timezone.utc).timestamp())
+            except Exception:
+                pts = int(time.time())
+            # Each image tile -> one flattened composite (pasted photo(s) + ink drawn on/in it).
+            box_images = []
+            for box in (PICKINGS_IMAGE_BOX_1, PICKINGS_IMAGE_BOX_2):
+                b_imgs = images_in_box(pickings_images, box)
+                b_strokes = strokes_in_box(pickings_strokes, box)
+                png = render_pickings_box(box, b_strokes, b_imgs, scale=2)
+                if png:
+                    b_caption = texts_in_box(pickings_texts, box) or shared_img_caption
+                    box_images.append({"data": base64.b64encode(png).decode(), "caption": b_caption})
+            board_suffix = "" if pkey == "pickings" else pkey[len("pickings-"):]
+            board_name = surface_names.get(pkey, "")
+            log.info(f"Pickings[{pkey}"
+                     + (f" '{board_name}'" if board_name else "")
+                     + f"] for {label}: notes_zone={len(notes_zone)} quotes_zone={len(quotes_zone)} "
+                     f"tiles={len(box_images)} pasted(notes={len(notes_pasted)},quotes={len(quotes_pasted)})")
+            post_pickings(pdate, pts, box_images, notes_text or "", quotes_text or "", notes_png, quotes_png,
+                          board_suffix=board_suffix, board_name=board_name)
+
+    # Synthesize pages -> mjh.yoga /notes/. Same rename problem, different surface: named
+    # topic pages are keyed "synthesize-<millis>". These are working pages rather than field
+    # journal entries, so they mirror to /notes/ (tagged Synthesize) and NOT to the public
+    # journal. Their OCR also still rides the day's ledger note, as before.
+    for skey in sorted(k for k in note_strokes_by_page if is_synth_key(k)):
+        post_named_note(pdate, skey, surface_names.get(skey, ""), "Synthesize",
+                        note_page_texts.get(skey) or "")
+
+    # Anything else that carries ink under a key nothing above claims: log it by name so a
+    # future named surface can never again go missing in silence.
+    _claimed = {"gratitude", "intake", "0", "1", "2", "3"}
+    for okey in sorted(note_strokes_by_page):
+        if is_pickings_key(okey) or is_synth_key(okey) or okey in _claimed or okey.isdigit():
+            continue
+        log.info(f"Note page '{okey}'"
+                 + (f" ('{surface_names[okey]}')" if surface_names.get(okey) else "")
+                 + f" for {label}: {len(note_strokes_by_page[okey])} strokes, "
+                 f"{len(note_page_texts.get(okey) or '')} chars -> day note only")
 
     # MichaelFilter intake page -> mjh.yoga intake endpoint (four panels: THE READ /
     # THE WATCH / THE LISTEN / EDUCATE ME). Crop each panel's ink like the pickings
@@ -1352,6 +1738,68 @@ def backfill_doodles():
     log.info(f"Doodle backfill done. {posted} doodles posted, {skipped} days had no doodle.")
 
 
+def render_pickings_page_dry(date_str, out_dir="/tmp"):
+    """Compose and render a day's Pickings page(s) WITHOUT publishing anything.
+
+    Posting is a side effect on a live site that Michael's readers see, so the composite has to
+    be inspectable before it ships: this walks the same merge -> zone -> render_pickings_box ->
+    render_pickings_page path process_day uses, writes each board's page to disk, and prints the
+    dimensions, the byte size and the exact payload shape that WOULD be posted. It touches
+    neither michaeljoelhall.com nor the state file.
+
+    OCR is deliberately skipped — the caption is the only thing that depends on it and it costs a
+    Claude call per zone, so a dry run reports the caption as coming from OCR at post time.
+    """
+    by_date = find_device_day_files()
+    name = next((n for n in sorted(by_date) if date_str in n), None)
+    if not name:
+        log.error("No day JSON found for %s", date_str)
+        return
+    merged = merge_day_data(sorted(by_date[name], key=lambda p: str(p)))
+
+    all_images = merged.get("imageElements") or []
+    all_texts = merged.get("textElements") or []
+    note_strokes = {k: v for k, v in (merged.get("noteStrokes") or {}).items() if v}
+    keys = {k for k in note_strokes if is_pickings_key(k)}
+    keys |= {ie.get("page") for ie in all_images if is_pickings_key(ie.get("page"))}
+    keys |= {te.get("pageKey") for te in all_texts if is_pickings_key(te.get("pageKey"))}
+    if not keys:
+        log.info("No Pickings board on %s", date_str)
+        return
+    surface_names = named_page_names(date_str)
+
+    for pkey in sorted(keys, key=lambda k: (k != "pickings", k)):
+        strokes = note_strokes.get(pkey) or []
+        images = [ie for ie in all_images if ie.get("page") == pkey]
+        cells = []
+        for label, box in (("Notes", PICKINGS_NOTES_BOX), ("Quotes", PICKINGS_QUOTES_BOX),
+                           ("Image 1", PICKINGS_IMAGE_BOX_1), ("Image 2", PICKINGS_IMAGE_BOX_2)):
+            cells.append((label, render_pickings_box(box, strokes_in_box(strokes, box),
+                                                     images_in_box(images, box), scale=2)))
+        board_name = surface_names.get(pkey, "")
+        out = render_pickings_page(date_str, cells, board_name=board_name)
+        if not out:
+            log.info("Pickings[%s]: nothing on the board; no page rendered", pkey)
+            continue
+        data, ext, (w, h) = out
+        sid = "pickings-%s%s" % (date_str, "" if pkey == "pickings" else "-" + pkey[len("pickings-"):])
+        path = os.path.join(out_dir, "%s-page.%s" % (sid, ext))
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        board_tags = [board_name] if board_name and board_name.lower() != "pickings" else []
+        log.info("Pickings[%s%s] page: %dx%d, %d bytes (%s), cells=%s -> %s",
+                 pkey, (" '%s'" % board_name) if board_name else "", w, h, len(data), ext,
+                 [lbl for lbl, png in cells if png], path)
+        log.info("  would POST %s  platform=pickings type=image source_id=%s-page "
+                 "media[0]={data_base64:<%d bytes>, kind:image, filename:%s-page.%s} tags=%s "
+                 "caption=<Notes+Quotes OCR at post time>",
+                 SOCIAL_ARCHIVE_URL, sid, len(data), sid, ext, ["pickings", "page"] + board_tags)
+        if not (cells[2][1] or cells[3][1]):
+            log.info("  note: no image tile on this board, so at post time the page is composed "
+                     "only if the Notes/Quotes OCR comes back with something legible")
+
+
 def main():
     state = load_state()
     processed = state.get("processed", {})
@@ -1410,12 +1858,6 @@ if __name__ == "__main__":
                 os.environ.setdefault(k.strip(), v.strip())
         WEBDAV_JSON_DIR = os.environ.get("LEDGER_JSON_DIR", WEBDAV_JSON_DIR)
         LEDGER_DATA_ROOT = os.environ.get("LEDGER_DATA_ROOT", LEDGER_DATA_ROOT)
-        # Re-derive from the (possibly .env-overridden) json dir unless set explicitly —
-        # the crontab sets LEDGER_JSON_DIR inline, and media/ sits two levels up from it.
-        LEDGER_MEDIA_DIR = os.environ.get(
-            "LEDGER_MEDIA_DIR",
-            os.path.normpath(os.path.join(WEBDAV_JSON_DIR, "..", "..", "media")),
-        )
         STATE_FILE = os.environ.get("LEDGER_STATE_FILE", STATE_FILE)
         WEBHOOK_URL = os.environ.get("LEDGER_WEBHOOK_URL", WEBHOOK_URL)
         WEBHOOK_SECRET = os.environ.get("LEDGER_WEBHOOK_SECRET", WEBHOOK_SECRET)
@@ -1428,6 +1870,8 @@ if __name__ == "__main__":
         SOCIAL_ARCHIVE_SECRET = os.environ.get("SOCIAL_ARCHIVE_SECRET", SOCIAL_ARCHIVE_SECRET)
         NOTES_CREATE_TAGGED_URL = os.environ.get("NOTES_CREATE_TAGGED_URL", NOTES_CREATE_TAGGED_URL)
         NOTES_INGEST_SECRET = os.environ.get("NOTES_INGEST_SECRET", NOTES_INGEST_SECRET)
+        SYNDICATION_ACK_URL = os.environ.get("SYNDICATION_ACK_URL", SYNDICATION_ACK_URL)
+        SYNDICATION_SECRET = os.environ.get("SYNDICATION_SECRET", SYNDICATION_SECRET)
 
     # Single-instance guard: stop a manual run and the 15-min cron (or two
     # crons) from running concurrently and double-creating tasks.
@@ -1441,5 +1885,8 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "backfill-doodles":
         backfill_doodles()
+    elif len(sys.argv) > 2 and sys.argv[1] == "render-pickings-page":
+        # Dry run: render only. Nothing is posted and no state is written.
+        render_pickings_page_dry(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "/tmp")
     else:
         main()
