@@ -767,6 +767,34 @@ def ledger_image_b64(ie):
         return None
 
 
+def gram_provenance(ie):
+    """What a gram SAYS it is, and where it came from — (caption, source_link).
+
+    This exists because the code here asked `ie.get("caption")` for years and always got
+    nothing: `caption` is not a field on the wire. `ImageElement` carries elementId, timestamp,
+    geometry, data/dataRef, page, **sourceLink, sourceLabel, sourceFeed, mediaTitle, mediaDate,
+    cardText**, gramId, the A/V pointers, and the intake keys — and no caption anywhere. So every
+    picking this mirrored went up mute, which is exactly what "the pickings provenance didn't
+    carry over into anything meaningful" looks like from the reading end.
+
+    The caption prefers what the creator chose (mediaTitle), then the words a text card was drawn
+    from (cardText), then the human name of the origin (sourceLabel), then the publication
+    (sourceFeed) — first non-empty wins, because they are increasingly generic. The link is
+    sourceLink, which may be an http(s) URL (a feed article, a book's web source) or an internal
+    address like `ledger://<date>/<page>` or `mail://<id>`; only the http kind is worth printing
+    on the web, so the caller decides what to do with it rather than being handed a dead link.
+    """
+    def s(key):
+        v = ie.get(key)
+        return v.strip() if isinstance(v, str) else ""
+
+    caption = s("mediaTitle") or s("cardText") or s("sourceLabel") or s("sourceFeed")
+    # A card's own words can run long; a caption is a line, not the essay.
+    if len(caption) > 300:
+        caption = caption[:297].rstrip() + "…"
+    return caption, s("sourceLink")
+
+
 def render_pickings_box(box, strokes, images, scale=2):
     """Flatten everything filling one Pickings image tile — any pasted image(s) PLUS the
     ink strokes drawn in or on top of them — into a single cropped PNG. Returns bytes or
@@ -1334,12 +1362,12 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
     # Image 1 + Image 2 -> their own entries (square composites of pasted photo + ink).
     # Each tile carries the pasted quote/caption text so the picture shows the words too
     # (MJH: the pasted text should ride ON the image AND stand alone as the quote).
-    image_urls = []  # (url, caption) so the mjh.yoga mirror can show the caption under each image
+    image_urls = []  # (url, caption, source_link) so the mirror can caption AND link each image
     for i, ie in enumerate(image_elements, 1):
         b64 = ledger_image_b64(ie)
         if not b64:
             continue
-        cap = (ie.get("caption") or "").strip()
+        cap, src = gram_provenance(ie)
         body = {
             "platform": "pickings", "type": "image",
             "source_id": f"{sid}-img{i}", "timestamp": timestamp,
@@ -1354,7 +1382,7 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
                 payload = r.json()
                 for m in (payload.get("media") or []):
                     if m.get("url"):
-                        image_urls.append((m["url"], cap))
+                        image_urls.append((m["url"], cap, src))
                 synd_suppress_from_queue(payload.get("post_id"), f"pickings image {i} {sid}")
         except Exception as e:
             log.error(f"Pickings image {i} post failed: {e}")
@@ -1433,11 +1461,19 @@ def post_pickings(date_str, timestamp, image_elements, notes_text, quotes_text,
                 html.append(f'<p><img src="{hand_urls["quotes"]}" style="max-width:100%;border-radius:4px"></p>')
             if quotes_text:
                 html.append("<blockquote>" + quotes_text.replace("\n", "<br>") + "</blockquote>")
-        for u, cap in image_urls:
+        for u, cap, src in image_urls:
             html.append(f'<figure style="margin:0 0 1em"><img src="{u}" style="max-width:100%;border-radius:4px">')
-            if cap:
+            # The caption and the way back. A picking is a thing you took FROM somewhere, so the
+            # note it becomes should say what it is and point at where it came from — a mirror
+            # that shows the picture and drops the provenance turns a citation into an orphan.
+            if cap or src:
+                bits = []
+                if cap:
+                    bits.append(cap.replace("\n", "<br>"))
+                if src.startswith("http"):
+                    bits.append(f'<a href="{src}" rel="noopener">source &rarr;</a>')
                 html.append('<figcaption style="font-size:.9em;color:#555;margin-top:.3em">'
-                            + cap.replace("\n", "<br>") + "</figcaption>")
+                            + " &middot; ".join(bits) + "</figcaption>")
             html.append("</figure>")
         html.append(f'<p><a href="https://michaeljoelhall.com/journal/{date_str}/">View in the journal &rarr;</a></p>')
         note_body = {
